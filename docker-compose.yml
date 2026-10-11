@@ -1,0 +1,42 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: ai_analyst_db
+    environment:
+      POSTGRES_DB: ai_analyst
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: root
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_analyst"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai_analyst_backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:root@db:5432/ai_analyst
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      MAX_UPLOAD_MB: 100
+      MAX_IMPORT_ROWS: 1000000
+      QUERY_TIMEOUT_MS: 5000
+      MAX_RESULT_ROWS: 500
+      ALLOWED_ORIGINS: '["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"]'
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
