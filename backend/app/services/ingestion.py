@@ -44,7 +44,7 @@ def map_dtype_to_postgres(series: pd.Series) -> str:
     else:
         # Check if sample strings look like dates or numbers
         non_nulls = series.dropna().head(50)
-        if len(non_nulls) > 0 and pd.to_datetime(non_nulls, errors='coerce').notnull().all():
+        if len(non_nulls) > 0 and pd.to_datetime(non_nulls, errors='coerce', format='mixed').notnull().all():
             return "TIMESTAMP"
         return "TEXT"
 

@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy import Column, String, Integer, DateTime, Boolean, Text, ForeignKey, JSON
 from sqlalchemy.orm import relationship
@@ -7,6 +7,9 @@ from app.core.database import Base
 
 def gen_uuid() -> str:
     return str(uuid.uuid4())
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 class Dataset(Base):
     __tablename__ = "datasets"
@@ -19,7 +22,7 @@ class Dataset(Base):
     status = Column(String(50), default="processing", nullable=False) # processing, ready, failed
     row_count = Column(Integer, default=0)
     error_summary = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     completed_at = Column(DateTime, nullable=True)
     
     tables = relationship("DatasetTable", back_populates="dataset", cascade="all, delete-orphan")
@@ -34,7 +37,7 @@ class DatasetTable(Base):
     table_name = Column(String(100), nullable=False, unique=True)
     display_name = Column(String(255), nullable=False)
     row_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     
     dataset = relationship("Dataset", back_populates="tables")
     columns = relationship("ColumnMetadata", back_populates="table", cascade="all, delete-orphan")
@@ -61,7 +64,7 @@ class RetrievalDocument(Base):
     content = Column(Text, nullable=False)
     metadata_json = Column(JSON, nullable=True)
     embedding_json = Column(JSON, nullable=True) # JSON array of floats for portable similarity across any Postgres instance
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     
     dataset = relationship("Dataset", back_populates="documents")
 
@@ -71,8 +74,8 @@ class Conversation(Base):
     id = Column(String(36), primary_key=True, default=gen_uuid)
     owner_id = Column(String(100), default="default_user", nullable=False)
     title = Column(String(255), default="New Analysis")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan", order_by="Message.created_at")
     query_runs = relationship("QueryRun", back_populates="conversation", cascade="all, delete-orphan")
@@ -85,7 +88,7 @@ class Message(Base):
     role = Column(String(20), nullable=False) # user, assistant, system
     content = Column(Text, nullable=False)
     metadata_json = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     
     conversation = relationship("Conversation", back_populates="messages")
 
@@ -99,6 +102,6 @@ class QueryRun(Base):
     status = Column(String(50), nullable=False) # success, rejected, failed, timeout
     execution_ms = Column(Integer, nullable=True)
     error_category = Column(String(100), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     
     conversation = relationship("Conversation", back_populates="query_runs")
