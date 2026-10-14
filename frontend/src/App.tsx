@@ -280,9 +280,10 @@ export default function App() {
       }
 
       const dataset = await res.json();
+      const datasetName = dataset.name || dataset.display_name || 'Dataset';
       const datasetInfo: ActiveDatasetInfo = {
         id: dataset.id,
-        name: dataset.name,
+        name: datasetName,
         rowCount: dataset.row_count,
       };
 
@@ -294,7 +295,7 @@ export default function App() {
         {
           id: crypto.randomUUID(),
           role: 'system',
-          content: `Dataset "${dataset.name}" ingested successfully (${dataset.row_count?.toLocaleString() || 0} rows, ${dataset.column_count || 0} columns). Ask any analytical question.`,
+          content: `Dataset "${datasetName}" ingested successfully (${dataset.row_count?.toLocaleString() || 0} rows). Ask any analytical question.`,
           status: 'success',
         },
       ]);

@@ -34,6 +34,7 @@ class MessageResponse(BaseModel):
 class DatasetResponse(BaseModel):
     id: str
     display_name: str
+    name: Optional[str] = None
     source_filename: str
     source_format: str
     status: str

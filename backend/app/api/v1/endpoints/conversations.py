@@ -84,3 +84,14 @@ def post_message(
                 "detail": err_msg
             }
         )
+
+@router.delete("/{conversation_id}")
+def delete_conversation(conversation_id: str, db: Session = Depends(get_db)):
+    """Deletes a conversation session and all its associated messages and query runs."""
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    db.delete(conv)
+    db.commit()
+    return {"message": "Conversation deleted successfully"}

@@ -483,7 +483,18 @@ class QueryOrchestrator:
             }
 
         elif row_cnt <= 5 and len(cols) == 2:
-            items = [f"{r[0]}: {r[1]}" for r in formatted_rows]
+            items = []
+            for r in formatted_rows:
+                val_raw = str(r[1]) if r[1] is not None else ""
+                try:
+                    num_val = float(val_raw)
+                    if "." in val_raw:
+                        num_fmt = f"{num_val:,.2f}"
+                    else:
+                        num_fmt = f"{int(num_val):,}"
+                except (ValueError, TypeError):
+                    num_fmt = val_raw
+                items.append(f"{r[0]}: {num_fmt}")
             summary = f"{explanation} Found: {', '.join(items)}."
             try:
                 float(formatted_rows[0][1])

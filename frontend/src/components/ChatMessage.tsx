@@ -164,39 +164,49 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({
         ) : null}
 
         {/* Minimal Result Bar Chart if visualization configured */}
-        {message.visualization && message.visualization.type === 'bar' && message.rows && message.rows.length > 1 && (
-          <div
-            className={`border rounded-lg p-3 text-xs transition-colors duration-300 ${
-              isDarkMode ? 'border-[#1f1f24] bg-[#0c0c0f]' : 'border-zinc-300 bg-white/95 shadow-sm'
-            }`}
-          >
-            <div className={`text-[11px] mb-2 font-mono ${isDarkMode ? 'text-zinc-500' : 'text-zinc-600'}`}>
-              {message.visualization.y} by {message.visualization.x}
-            </div>
-            <div className="space-y-1.5">
-              {message.rows.slice(0, 8).map((r, i) => {
-                const label = String(r[0]);
-                const val = Number(r[1]) || 0;
-                const maxVal = Math.max(...message.rows!.map((row) => Number(row[1]) || 0), 1);
-                const pct = Math.min(Math.round((val / maxVal) * 100), 100);
-                return (
-                  <div key={i} className="flex items-center gap-2">
-                    <span className={`w-24 truncate text-[11px] ${isDarkMode ? 'text-zinc-400' : 'text-zinc-600'}`}>{label}</span>
-                    <div className={`flex-1 h-3.5 rounded-sm overflow-hidden ${isDarkMode ? 'bg-[#18181d]' : 'bg-zinc-200'}`}>
-                      <div
-                        className={`h-full rounded-sm transition-all duration-300 ${isDarkMode ? 'bg-zinc-400' : 'bg-slate-700'}`}
-                        style={{ width: `${pct}%` }}
-                      />
+        {message.visualization && message.visualization.type === 'bar' && message.rows && message.rows.length > 1 && (() => {
+          const xCol = message.visualization.x;
+          const yCol = message.visualization.y;
+          const cols = message.columns || [];
+          const xIdx = cols.findIndex((c) => c.toLowerCase() === xCol.toLowerCase());
+          const yIdx = cols.findIndex((c) => c.toLowerCase() === yCol.toLowerCase());
+          const labelIdx = xIdx >= 0 ? xIdx : 0;
+          const valIdx = yIdx >= 0 ? yIdx : (cols.length > 1 ? 1 : 0);
+          const maxVal = Math.max(...message.rows.map((row) => Number(row[valIdx]) || 0), 1);
+
+          return (
+            <div
+              className={`border rounded-lg p-3 text-xs transition-colors duration-300 ${
+                isDarkMode ? 'border-[#1f1f24] bg-[#0c0c0f]' : 'border-zinc-300 bg-white/95 shadow-sm'
+              }`}
+            >
+              <div className={`text-[11px] mb-2 font-mono ${isDarkMode ? 'text-zinc-500' : 'text-zinc-600'}`}>
+                {yCol} by {xCol}
+              </div>
+              <div className="space-y-1.5">
+                {message.rows.slice(0, 8).map((r, i) => {
+                  const label = String(r[labelIdx] ?? '');
+                  const val = Number(r[valIdx]) || 0;
+                  const pct = Math.min(Math.round((val / maxVal) * 100), 100);
+                  return (
+                    <div key={i} className="flex items-center gap-2">
+                      <span className={`w-24 truncate text-[11px] ${isDarkMode ? 'text-zinc-400' : 'text-zinc-600'}`}>{label}</span>
+                      <div className={`flex-1 h-3.5 rounded-sm overflow-hidden ${isDarkMode ? 'bg-[#18181d]' : 'bg-zinc-200'}`}>
+                        <div
+                          className={`h-full rounded-sm transition-all duration-300 ${isDarkMode ? 'bg-zinc-400' : 'bg-slate-700'}`}
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+                      <span className={`w-16 text-right font-mono text-[11px] ${isDarkMode ? 'text-zinc-300' : 'text-zinc-800'}`}>
+                        {val.toLocaleString()}
+                      </span>
                     </div>
-                    <span className={`w-16 text-right font-mono text-[11px] ${isDarkMode ? 'text-zinc-300' : 'text-zinc-800'}`}>
-                      {val.toLocaleString()}
-                    </span>
-                  </div>
-                );
-              })}
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
       </div>
     </div>
   );

@@ -39,3 +39,8 @@ def test_create_conversation_and_chat():
     hist_res = client.get(f"/api/v1/conversations/{conv_id}/messages")
     assert hist_res.status_code == 200
     assert len(hist_res.json()) >= 2
+
+    # 5. Delete conversation
+    del_res = client.delete(f"/api/v1/conversations/{conv_id}")
+    assert del_res.status_code == 200
+

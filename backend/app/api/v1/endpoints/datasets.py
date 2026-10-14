@@ -10,6 +10,7 @@ from app.schemas.chat import DatasetResponse
 router = APIRouter()
 
 @router.post("", response_model=DatasetResponse)
+@router.post("/upload", response_model=DatasetResponse)
 async def upload_dataset(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
@@ -25,6 +26,7 @@ async def upload_dataset(
         return DatasetResponse(
             id=dataset.id,
             display_name=dataset.display_name,
+            name=dataset.display_name,
             source_filename=dataset.source_filename,
             source_format=dataset.source_format,
             status=dataset.status,
@@ -43,6 +45,7 @@ def list_datasets(db: Session = Depends(get_db)):
         DatasetResponse(
             id=d.id,
             display_name=d.display_name,
+            name=d.display_name,
             source_filename=d.source_filename,
             source_format=d.source_format,
             status=d.status,
@@ -62,6 +65,7 @@ def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
     return DatasetResponse(
         id=dataset.id,
         display_name=dataset.display_name,
+        name=dataset.display_name,
         source_filename=dataset.source_filename,
         source_format=dataset.source_format,
         status=dataset.status,

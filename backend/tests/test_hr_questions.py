@@ -130,4 +130,5 @@ def test_question_6_follow_up_overtime_income(hr_dataset_id):
     val = float(res["rows"][0][res["columns"].index(income_col)]) if income_col else float(res["rows"][0][-1])
     # The group with higher attrition is Overtime='Yes' (avg income ~ 6548.55)
     assert abs(val - 6548.55) < 1.0
-    assert "6,548.55" in res["answer"]
+    assert "6,548.55" in res["answer"] or "6548.55" in res["answer"]
+

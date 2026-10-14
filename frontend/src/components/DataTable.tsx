@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Copy, Check } from 'lucide-react';
 import { formatTableAsTsv, copyTextToClipboard } from '../utils/format';
 
@@ -23,6 +23,8 @@ export const DataTable: React.FC<DataTableProps> = ({
   copiedId,
   onSetCopiedId,
 }) => {
+  const [showAll, setShowAll] = useState(false);
+
   if (!columns.length || !rows.length) return null;
 
   const totalRows = rowCount || rows.length;
@@ -95,7 +97,7 @@ export const DataTable: React.FC<DataTableProps> = ({
             </tr>
           </thead>
           <tbody className={`divide-y ${isDarkMode ? 'divide-[#16161b]' : 'divide-zinc-200'}`}>
-            {rows.slice(0, 15).map((row, rIdx) => (
+            {(showAll ? rows : rows.slice(0, 15)).map((row, rIdx) => (
               <tr
                 key={rIdx}
                 className={`transition-colors ${isDarkMode ? 'hover:bg-[#16161c]' : 'hover:bg-zinc-50'}`}
@@ -117,11 +119,20 @@ export const DataTable: React.FC<DataTableProps> = ({
       </div>
       {rows.length > 15 && (
         <div
-          className={`text-[11px] px-3 py-1.5 border-t select-none ${
+          className={`text-[11px] px-3 py-1.5 border-t select-none flex items-center justify-between ${
             isDarkMode ? 'text-zinc-500 border-[#18181c]' : 'text-zinc-500 border-zinc-200'
           }`}
         >
-          Showing 15 of {totalRows} rows
+          <span>Showing {showAll ? rows.length : 15} of {totalRows} rows</span>
+          <button
+            type="button"
+            onClick={() => setShowAll((prev) => !prev)}
+            className={`cursor-pointer underline transition-colors ${
+              isDarkMode ? 'text-zinc-400 hover:text-zinc-200' : 'text-zinc-600 hover:text-zinc-900'
+            }`}
+          >
+            {showAll ? 'Show less' : `Show all ${rows.length} rows`}
+          </button>
         </div>
       )}
     </div>
