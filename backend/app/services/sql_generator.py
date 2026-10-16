@@ -34,6 +34,29 @@ Rules:
 }
 """
 
+SQL_REPAIR_SYSTEM_PROMPT = """You are a senior PostgreSQL engineer performing executable-query self-correction.
+A previously generated SELECT query failed during execution. Root-cause the failure and return a corrected query.
+
+Steps:
+1. Compare the Failed SQL against the PostgreSQL error message and the table schema.
+2. Identify the root cause (examples: a column referenced through a joined CTE that does not project it, a wrong column name, a type mismatch, or an ambiguous alias).
+3. Produce a corrected single SELECT query that preserves the original analytical objective.
+
+Rules:
+1. ONLY produce a single SELECT statement (CTEs, subqueries, and UNION ALL are allowed).
+2. Use the exact internal table name and column names provided in the schema. Never invent columns.
+3. If you join or reference a CTE or alias, every selected column must exist in that CTE's own projection.
+4. Keep the same result intent (same aggregations, filters, and comparisons) as the failed query.
+5. If the query cannot be repaired without new information (e.g. the needed column truly does not exist), return status "unfixable" with sql: null.
+
+Return JSON format:
+{
+  "status": "query" | "unfixable",
+  "sql": "SELECT ..." or null,
+  "explanation": "Root cause of the failure and description of the fix"
+}
+"""
+
 def _transform_sql_to_only_column(sql: str, target_col: str, fallback_table: Optional[str] = None) -> Optional[str]:
     """
     Safely modifies an existing SQL query to project only target_col (and any heading/label column),
@@ -99,7 +122,8 @@ class SQLGenerator:
         columns: List[Dict[str, str]],
         retrieved_context: Optional[List[str]] = None,
         conversation_context: Optional[List[Dict[str, str]]] = None,
-        request_id: Optional[str] = None
+        request_id: Optional[str] = None,
+        schema_override: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Translates a natural language question into PostgreSQL SQL.
@@ -159,9 +183,12 @@ class SQLGenerator:
                 normalized_cols.append({"name": str(c), "type": "text"})
         columns = normalized_cols
 
-        schema_desc = f"Table: {table_name}\nColumns:\n" + "\n".join(
-            [f"- {c['name']} ({c['type']})" for c in columns]
-        )
+        if schema_override:
+            schema_desc = schema_override
+        else:
+            schema_desc = f"Table: {table_name}\nColumns:\n" + "\n".join(
+                [f"- {c['name']} ({c['type']})" for c in columns]
+            )
         context_str = "\n".join(retrieved_context or [])
         
         history_lines = []
@@ -251,6 +278,137 @@ class SQLGenerator:
             "error": None
         }
         return res
+
+    @classmethod
+    def regenerate_with_execution_error(
+        cls,
+        question: str,
+        table_name: str,
+        columns: List[Dict[str, str]],
+        failed_sql: str,
+        db_error: str,
+        conversation_context: Optional[List[Dict[str, str]]] = None,
+        request_id: Optional[str] = None,
+        schema_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Self-correction loop: re-prompts the LLM with the original question, the
+        failed SQL, and the exact PostgreSQL error, returning a repaired query.
+        Returns status "repaired" (with SQL), "unfixable", "no_llm", or "repair_failed".
+        """
+        req_id = request_id or "local"
+        llm_key = settings.LLM_API_KEY
+
+        if not (llm_key and llm_key.strip()):
+            return {
+                "status": "no_llm",
+                "sql": None,
+                "explanation": "No LLM API key configured; execution self-correction unavailable.",
+                "diagnostics": {"mode": "execution_repair", "fresh_response": False}
+            }
+
+        # Normalize columns for the schema description
+        normalized_cols = []
+        for c in (columns or []):
+            if isinstance(c, dict):
+                normalized_cols.append({"name": str(c.get("name", "")), "type": str(c.get("type", "text"))})
+            else:
+                normalized_cols.append({"name": str(c), "type": "text"})
+        columns = normalized_cols
+
+        if schema_override:
+            schema_desc = schema_override
+        else:
+            schema_desc = f"Table: {table_name}\nColumns:\n" + "\n".join(
+                [f"- {c['name']} ({c['type']})" for c in columns]
+            )
+        history_lines = []
+        for m in (conversation_context or []):
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            sql = m.get("sql")
+            if sql:
+                history_lines.append(f"{role}: {content}")
+            else:
+                history_lines.append(f"{role}: {content}")
+        history_str = "\n".join(history_lines)
+
+        repair_prompt = (
+            f"Original Question: {question}\n\n"
+            f"Schema:\n{schema_desc}\n\n"
+            f"History:\n{history_str}\n\n"
+            f"Failed SQL:\n{failed_sql}\n\n"
+            f"PostgreSQL Error:\n{db_error}\n\n"
+            f"Return the corrected query as JSON."
+        )
+
+        provider = settings.LLM_PROVIDER.lower() if settings.LLM_PROVIDER else "openai"
+        if llm_key.startswith("gsk_") or provider == "groq":
+            provider = "groq"
+
+        model_name = settings.LLM_MODEL
+        if provider == "groq" and (model_name == "gpt-4o-mini" or not model_name):
+            model_name = "openai/gpt-oss-120b"
+
+        try:
+            if provider == "groq":
+                try:
+                    from groq import Groq
+                    client = Groq(api_key=llm_key)
+                except ImportError:
+                    from openai import OpenAI
+                    client = OpenAI(api_key=llm_key, base_url="https://api.groq.com/openai/v1")
+            else:
+                from openai import OpenAI
+                client = OpenAI(api_key=llm_key)
+
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": SQL_REPAIR_SYSTEM_PROMPT},
+                    {"role": "user", "content": repair_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0
+            )
+            content = response.choices[0].message.content
+            result = json.loads(content)
+            sql = result.get("sql")
+            status = result.get("status")
+            if status == "query" and sql:
+                final_status = "repaired"
+            else:
+                final_status = "unfixable"
+                sql = None
+            return {
+                "status": final_status,
+                "sql": sql,
+                "explanation": result.get("explanation"),
+                "diagnostics": {
+                    "mode": "execution_repair",
+                    "llm_provider": provider,
+                    "llm_model": model_name,
+                    "fresh_response": True,
+                    "error": None
+                }
+            }
+        except Exception as e:
+            logger.warning(
+                "[%s] Execution-error repair call failed (provider=%s, model=%s, error=%s: %s).",
+                req_id, provider, model_name, type(e).__name__, str(e)
+            )
+            return {
+                "status": "repair_failed",
+                "sql": None,
+                "explanation": f"Repair attempt failed: {type(e).__name__}: {str(e)}",
+                "diagnostics": {
+                    "mode": "execution_repair",
+                    "llm_provider": provider,
+                    "llm_model": model_name,
+                    "fresh_response": False,
+                    "error": f"{type(e).__name__}: {str(e)}"
+                }
+            }
 
     @classmethod
     def _dynamic_analytical_generate(
@@ -517,8 +675,8 @@ class SQLGenerator:
                     "clarification_question": None
                 }
 
-        # 8. Filter by city or location (e.g. "Show orders from Hyderabad")
-        if "orders from" in q or "from hyderabad" in q or "show orders" in q or "in hyderabad" in q:
+        # 8. Filter by city or location (e.g. "Show orders from Hyderabad", "Now only show Hyderabad")
+        if "orders from" in q or "from hyderabad" in q or "show orders" in q or "in hyderabad" in q or "hyderabad" in q:
             city_col = find_col(["city", "location", "place"])
             city_val = "hyderabad" if "hyderabad" in q else "all"
             if city_col:

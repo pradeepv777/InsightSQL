@@ -128,6 +128,7 @@ python -m pytest tests/ -v
 - `test_ingestion.py`: Validates schema type inference, null-rate profiling, and data ingestion limits across file formats.
 - `test_evaluation.py`: Evaluates analytical benchmark scenarios across aggregations (`AVG`, `SUM`), filters (`WHERE`), ranking (`TOP K`), duplicates, and null counts.
 - `test_hr_questions.py`: Tests domain-specific business queries and multi-turn conversational follow-up resolution.
+- `test_self_correction.py`: Deterministically verifies the execution self-correction loop (LLM-mocked positive/negative retry paths).
 
 ---
 

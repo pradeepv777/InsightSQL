@@ -141,9 +141,9 @@ class QueryOrchestrator:
         diag["dataset_id"] = str(active_dataset.id)
         diag["dataset_name"] = active_dataset.display_name
 
-        # Find primary table for active dataset
-        ds_table = db.query(DatasetTable).filter(DatasetTable.dataset_id == active_dataset.id).first()
-        if not ds_table:
+        # Find tables for active dataset
+        all_ds_tables = db.query(DatasetTable).filter(DatasetTable.dataset_id == active_dataset.id).all()
+        if not all_ds_tables:
             ans = f"Dataset '{active_dataset.display_name}' has no available tables."
             asst_msg = Message(conversation_id=conversation_id, role="assistant", content=ans)
             db.add(asst_msg)
@@ -163,10 +163,28 @@ class QueryOrchestrator:
                 "warnings": []
             }
 
+        ds_table = all_ds_tables[0]
         table_name = ds_table.table_name
         diag["table_name"] = table_name
-        columns_meta = db.query(ColumnMetadata).filter(ColumnMetadata.dataset_table_id == ds_table.id).all()
-        col_list = [{"name": c.column_name, "type": c.database_type} for c in columns_meta]
+
+        # If multi-table relational dataset, build full multi-table schema and allow all tables
+        if len(all_ds_tables) > 1:
+            allowed_tables = {t.table_name for t in all_ds_tables}
+            schema_blocks = []
+            col_list = []
+            for dt in all_ds_tables:
+                dt_cols = db.query(ColumnMetadata).filter(ColumnMetadata.dataset_table_id == dt.id).all()
+                c_lines = [f"- {c.column_name} ({c.database_type})" for c in dt_cols]
+                schema_blocks.append(f"Table: {dt.table_name}\nColumns:\n" + "\n".join(c_lines))
+                for c in dt_cols:
+                    col_list.append({"name": c.column_name, "type": c.database_type, "table": dt.table_name})
+            multi_table_schema = "\n\n".join(schema_blocks)
+            columns_meta = db.query(ColumnMetadata).filter(ColumnMetadata.dataset_table_id == ds_table.id).all()
+        else:
+            allowed_tables = {table_name}
+            columns_meta = db.query(ColumnMetadata).filter(ColumnMetadata.dataset_table_id == ds_table.id).all()
+            col_list = [{"name": c.column_name, "type": c.database_type} for c in columns_meta]
+            multi_table_schema = None
 
         # 4. Check for direct metadata profile questions
         if "how many rows and columns" in q_lower or ("rows and columns" in q_lower and "how many" in q_lower):
@@ -271,7 +289,8 @@ class QueryOrchestrator:
             columns=col_list,
             retrieved_context=rag_context,
             conversation_context=conv_context,
-            request_id=request_id
+            request_id=request_id,
+            schema_override=multi_table_schema
         )
 
         plan_diag = sql_plan.get("diagnostics", {})
@@ -310,7 +329,6 @@ class QueryOrchestrator:
         explanation = sql_plan.get("explanation", "Executed analytical query.")
 
         # 9. Validate SQL against strict security policy
-        allowed_tables = {table_name}
         validated_sql = None
         try:
             validated_sql = SQLPolicyValidator.validate_and_format(proposed_sql, allowed_tables)
@@ -377,24 +395,79 @@ class QueryOrchestrator:
         # 10. Execute query safely with read-only connection & statement timeout
         exec_start = time.time()
         diag["queried_postgres"] = True
+        current_sql = validated_sql
+        exec_last_error = None
+        max_exec_retries = 1 if str(diag.get("generation_mode", "")).startswith("llm") else 0
+
+        def _is_retryable_exec_error(err_str: str) -> bool:
+            """Skip self-correction for timeouts/cancellations to keep latency bounded."""
+            lowered = err_str.lower()
+            return not ("canceling statement" in lowered or "statement_timeout" in lowered)
+
         try:
-            with query_engine.connect() as conn:
-                res = conn.execute(text(validated_sql))
-                cols = list(res.keys())
-                raw_rows = res.fetchall()
-                formatted_rows = [
-                    [str(v) if v is not None else None for v in row]
-                    for row in raw_rows
-                ]
+            for attempt in range(max_exec_retries + 1):
+                try:
+                    with query_engine.connect() as conn:
+                        res = conn.execute(text(current_sql))
+                        cols = list(res.keys())
+                        raw_rows = res.fetchall()
+                        formatted_rows = [
+                            [str(v) if v is not None else None for v in row]
+                            for row in raw_rows
+                        ]
+                    exec_ms = int((time.time() - exec_start) * 1000)
+                    diag["execution_status"] = "success"
+                    diag["execution_ms"] = exec_ms
+                    diag["row_count"] = len(formatted_rows)
+                    diag["execution_attempts"] = attempt + 1
+                    break
+                except Exception as exec_err:
+                    exec_last_error = str(exec_err)
+                    diag["execution_error_class"] = type(exec_err).__name__
+                    if (
+                        attempt >= max_exec_retries
+                        or not _is_retryable_exec_error(exec_last_error)
+                    ):
+                        raise
+                    # Execution failed but policy passed -> LLM self-correction loop.
+                    # Re-prompt with the exact PostgreSQL error (root-cause grounded repair).
+                    if attempt == 0:
+                        logger.warning(
+                            "[%s] SQL execution failed (%s). Attempting LLM execution self-correction.",
+                            request_id, type(exec_err).__name__
+                        )
+                    repair_plan = SQLGenerator.regenerate_with_execution_error(
+                        question=question,
+                        table_name=table_name,
+                        columns=col_list,
+                        failed_sql=current_sql,
+                        db_error=exec_last_error,
+                        conversation_context=conv_context,
+                        request_id=request_id,
+                        schema_override=multi_table_schema
+                    )
+                    rep_sql = repair_plan.get("sql")
+                    rep_status = repair_plan.get("status")
+                    diag["execution_repair_status"] = rep_status
+                    if not rep_status or not rep_sql:
+                        # unfixable / no_llm / repair_failed -> surface original failure
+                        raise exec_err
+                    # Repaired SQL must satisfy the same security policy before execution
+                    current_sql = SQLPolicyValidator.validate_and_format(rep_sql, allowed_tables)
+                    diag["execution_repair_attempted"] = True
+                    diag["repaired_sql"] = current_sql
+                    rep_diag = repair_plan.get("diagnostics") or {}
+                    diag["repair_llm_model"] = rep_diag.get("llm_model")
             exec_ms = int((time.time() - exec_start) * 1000)
-            diag["execution_status"] = "success"
-            diag["execution_ms"] = exec_ms
-            diag["row_count"] = len(formatted_rows)
+            validated_sql = current_sql
         except Exception as e:
             exec_ms = int((time.time() - exec_start) * 1000)
             err_msg = str(e)
             diag["execution_status"] = "failed"
             diag["execution_ms"] = exec_ms
+            if diag.get("execution_repair_attempted"):
+                diag["execution_attempts"] = 2
+                diag["error_category"] = "EXECUTION_ERROR_AFTER_REPAIR"
             diag["final_status"] = "failed"
             log_diagnostic_event(diag)
             ans = f"Query execution failed: {err_msg}"
@@ -402,10 +475,10 @@ class QueryOrchestrator:
             q_run = QueryRun(
                 conversation_id=conversation_id,
                 question=question,
-                generated_sql=validated_sql,
+                generated_sql=current_sql,
                 status="failed",
                 execution_ms=exec_ms,
-                error_category="EXECUTION_ERROR"
+                error_category=diag.get("error_category", "EXECUTION_ERROR")
             )
             db.add(asst_msg)
             db.add(q_run)
@@ -464,6 +537,21 @@ class QueryOrchestrator:
             cnt_idx = cols.index("attrition_count") if "attrition_count" in cols else None
             group_name = cols[0].replace("_", " ").title()
 
+            # Optional secondary metric column (e.g. avg_monthly_income) shown with the rate
+            metric_idx = None
+            for i, c in enumerate(cols):
+                if i in (0, rate_idx) or c in ("total_employees", "attrition_count"):
+                    continue
+                if any(k in c.lower() for k in ["avg", "income", "salary", "amount", "value", "cost"]):
+                    metric_idx = i
+                    break
+
+            def _fmt_metric(raw):
+                try:
+                    return f"${float(raw):,.2f}"
+                except (ValueError, TypeError):
+                    return str(raw) if raw is not None else "N/A"
+
             lines = [f"{explanation}"]
             for r in formatted_rows:
                 grp = r[0]
@@ -471,9 +559,13 @@ class QueryOrchestrator:
                 if tot_idx is not None and cnt_idx is not None:
                     tot = r[tot_idx]
                     cnt = r[cnt_idx]
-                    lines.append(f"- **{grp}**: {pct}% ({cnt} left out of {tot} employees)")
+                    base = f"- **{grp}**: {pct}% ({cnt} left out of {tot} employees)"
                 else:
-                    lines.append(f"- **{grp}**: {pct}%")
+                    base = f"- **{grp}**: {pct}%"
+                if metric_idx is not None:
+                    metric_label = cols[metric_idx].replace("_", " ")
+                    base = f"{base} with {metric_label}: {_fmt_metric(r[metric_idx])}"
+                lines.append(base)
             summary = "\n".join(lines)
 
             visualization = {
@@ -507,9 +599,9 @@ class QueryOrchestrator:
                 pass
 
         elif row_cnt <= 20 and len(cols) <= 4:
-            items = [f"{r[0]} ({r[1]})" for r in formatted_rows[:5]]
+            items = [f"{r[0]} ({r[1]})" if len(r) > 1 else str(r[0]) for r in formatted_rows[:5]]
             summary = f"{explanation} Returned {row_cnt:,} records. Top entries: {', '.join(items)}."
-            if len(cols) == 2:
+            if len(cols) == 2 and len(formatted_rows[0]) > 1:
                 try:
                     float(formatted_rows[0][1])
                     visualization = {"type": "bar", "x": cols[0], "y": cols[1]}
