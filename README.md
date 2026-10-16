@@ -1,74 +1,28 @@
-# InsightSQL 🔍
+# InsightSQL
 
-> **High-Performance, AST-Guarded Natural Language to SQL Analytics Engine**
-
-[![Python 3.12](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg)](https://fastapi.tiangolo.com/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791.svg)](https://www.postgresql.org/)
-[![Groq](https://img.shields.io/badge/Inference-Groq%20LPU-f55036.svg)](https://groq.com/)
-[![SQLGlot](https://img.shields.io/badge/SQL%20Security-SQLGlot%20AST-orange.svg)](https://github.com/tobymao/sqlglot)
-[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg)](https://www.docker.com/)
-
-InsightSQL is an enterprise-grade conversational data analytics engine that translates complex natural language business questions into precise, executable PostgreSQL queries. Designed with a **security-first philosophy**, it couples low-latency LLM inference (powered by Groq) with strict Abstract Syntax Tree (AST) validation to guarantee read-only database safety and eliminate SQL injection risks.
+InsightSQL is a conversational data analytics engine that translates natural language business questions into executable SQL queries.
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
-- **⚡ Sub-Second Query Synthesis**: Integrates Groq LPU inference for ultra-fast, low-latency SQL code generation with deterministic JSON output schemas.
-- **🛡️ AST-Level Security Sandbox**: Evaluates all generated queries using `sqlglot` to enforce single-`SELECT` statements, reject destructive DDL/DML, block system schemas (`pg_catalog`, `information_schema`), and restrict queries to authorized table allowlists.
-- **📚 Schema-Aware Retrieval (RAG)**: Indexes table schemas, data types, null profiles, and business definitions using a BM25 lexical ranking engine to ground LLM prompts with exact catalog context.
-- **💬 Conversational Memory & Multi-Turn Context**: Maintains conversational state across dialogue turns, resolving contextual follow-ups (*e.g., "Now filter for Bangalore"*) and tracking query lineage.
-- **📊 Automated Dataset Ingestion**: Ingests CSV, Excel, Parquet, and JSON datasets with automatic data type inference, column statistics profiling, and schema generation.
-- **⏱️ Bounded Execution Engine**: Implements strict query timeouts (5000ms), result pagination/row caps, and isolated database sessions to safeguard database stability.
-- **🧪 12-Scenario Verification Suite**: Includes comprehensive automated test suites benchmarking aggregations, rankings, filters, multi-turn contexts, and destructive injection attacks.
-
----
-
-## 🏗️ Architecture
-
-```mermaid
-flowchart TD
-    User([User / Client]) -->|Natural Language Question| API[FastAPI Orchestrator]
-    
-    subgraph Data Ingestion & Context
-        Upload[Dataset Upload: CSV/Excel/Parquet] --> Ingest[Ingestion Service]
-        Ingest --> Profiling[Column Profiling & Types]
-        Profiling --> DB_Store[(PostgreSQL Database)]
-        Profiling --> Catalog[Schema Document Store]
-    end
-
-    subgraph RAG & Generation
-        API --> State[Conversation Memory]
-        API --> Retrieval[BM25 Schema Retrieval]
-        Catalog --> Retrieval
-        Retrieval --> Prompt[Context-Injected Prompt]
-        State --> Prompt
-        Prompt --> Groq[Groq LPU / LLM Engine]
-        Groq --> RawSQL[Generated SQL Candidate]
-    end
-
-    subgraph Security Sandbox
-        RawSQL --> AST[SQLGlot AST Parser]
-        AST --> Rules{Security Policies}
-        Rules -->|DDL / DML Detected| Reject[Reject Query / Return Error]
-        Rules -->|Unauthorized Table| Reject
-        Rules -->|Multiple Statements| Reject
-        Rules -->|Valid Single SELECT| SafeSQL[Safe SQL]
-    end
-
-    subgraph Execution & Delivery
-        SafeSQL --> Exec[PostgreSQL Query Runner]
-        DB_Store --> Exec
-        Exec --> Format[Result Formatting & Metrics]
-        Format --> API
-        API --> User
-    end
-```
+- **Sub-Second Query Synthesis**: Integrates Groq LPU inference for ultra-fast, low-latency SQL code generation with deterministic JSON output schemas.
+- **AST-Level Security Sandbox**: Evaluates all generated queries using `sqlglot` to enforce single-`SELECT` statements, reject destructive DDL/DML, block system schemas (`pg_catalog`, `information_schema`), and restrict queries to authorized table allowlists.
+- **Schema-Aware Retrieval (RAG)**: Indexes table schemas, data types, null profiles, and business definitions using a BM25 lexical ranking engine to ground LLM prompts with exact catalog context.
+- **Conversational Memory & Multi-Turn Context**: Maintains conversational state across dialogue turns, resolving contextual follow-ups (*e.g., "Now filter for Bangalore"*) and tracking query lineage.
+- **Automated Dataset Ingestion**: Ingests CSV, Excel, Parquet, and JSON datasets with automatic data type inference, column statistics profiling, and schema generation.
+- **Bounded Execution Engine**: Implements strict query timeouts (5000ms), result pagination/row caps, and isolated database sessions to safeguard database stability.
+- **12-Scenario Verification Suite**: Includes comprehensive automated test suites benchmarking aggregations, rankings, filters, multi-turn contexts, and destructive injection attacks.
 
 ---
 
-## 🛡️ Security & Guardrails
+## Architecture
+
+![alt text](<Text-to-SQL Architecture Diagram.png>)
+
+---
+
+## Security & Guardrails
 
 InsightSQL prevents untrusted code execution using defense-in-depth security policies:
 
@@ -82,7 +36,7 @@ InsightSQL prevents untrusted code execution using defense-in-depth security pol
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 - **Backend Framework**: Python 3.12+, FastAPI, Uvicorn, Pydantic v2
 - **Database & ORM**: PostgreSQL 16, SQLAlchemy 2.0, Psycopg 3
@@ -94,7 +48,7 @@ InsightSQL prevents untrusted code execution using defense-in-depth security pol
 
 ---
 
-## 🚀 Quickstart
+## Quickstart
 
 ### Prerequisites
 - [Docker](https://www.docker.com/) & Docker Compose **OR** Python 3.12+ with PostgreSQL installed locally.
@@ -159,7 +113,7 @@ Access the web client at `http://localhost:5173`.
 
 ---
 
-## 🧪 Testing & Evaluation
+## Testing & Evaluation
 
 InsightSQL includes a comprehensive evaluation and regression suite validating query generation correctness, AST security, and conversational context:
 
@@ -176,7 +130,7 @@ python -m pytest tests/ -v
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
 InsightSQL/
@@ -202,6 +156,6 @@ InsightSQL/
 
 ---
 
-## 📜 License
+## License
 
 This project is licensed under the [MIT License](LICENSE).
