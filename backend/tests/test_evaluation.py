@@ -119,3 +119,19 @@ def test_eval_case_12_documentation(sample_dataset):
     db.close()
     assert res["status"] == "success"
     assert "discounts, refunds, and taxes" in res["answer"]
+
+def test_eval_table_misspelling_and_affirmation(sample_dataset):
+    db = SessionLocal()
+    conv_id = str(uuid.uuid4())
+    # 1. User asks 'select * from tablw'
+    res1 = QueryOrchestrator.process_message(db, conv_id, "select * from tablw", [sample_dataset])
+    assert res1["status"] in ("success", "clarification_needed")
+    if res1["status"] == "success":
+        assert "select" in res1["sql"].lower()
+    else:
+        # 2. User confirms with 'yes it is correct'
+        res2 = QueryOrchestrator.process_message(db, conv_id, "yes it is correct", [sample_dataset])
+        assert res2["status"] == "success"
+        assert "select" in res2["sql"].lower()
+    db.close()
+

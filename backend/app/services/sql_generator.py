@@ -13,8 +13,13 @@ Rules:
 1. ONLY produce a single SELECT statement (CTEs, subqueries, and UNION ALL are allowed if needed to combine subsets or rankings).
 2. Never produce INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, or administration commands.
 3. Use the exact internal table name and column names provided in the schema context.
+   - When the user refers to "table", "the table", "data", "dataset", or has a typo like "tablw", ALWAYS map it to the active table name provided in the schema. Do NOT ask for clarification if there is an available table.
 4. If the question is truly ambiguous (such as an undefined quarter or missing business metric not in the dataset), return status: "clarification_needed" with a polite clarification_question and explanation.
-5. Multi-turn Follow-up Handling:
+5. Clarification Affirmation & Confirmation:
+   - If the previous assistant message asked for clarification (such as confirming a table name or column), and the user responds with an affirmative confirmation (e.g., "yes", "correct", "yes it is correct", "yeah", "confirm", "ok", "sure", "do it", or confirms/quotes the table name):
+     * You MUST NOT ask for clarification again.
+     * You MUST immediately accept the confirmation, resolve the question to the clarified entity/table, and generate the final SELECT query.
+6. Multi-turn Follow-up Handling:
    - When conversation history is present and the user asks a follow-up request (e.g., "only calories column", "now only show X", "filter to Y", "order by Z", "also include W"):
      * ALWAYS preserve the previous query's core logic, filters, calculations, subqueries, and table references.
      * Treat follow-ups as natural conversational refinements, NEVER as a conflict. Do NOT ask for clarification when modifying columns or filters.
@@ -23,9 +28,9 @@ Rules:
        - You MUST keep all CTEs, WHERE filters, MAX/MIN subqueries, and UNION ALL branches from the previous query in history.
        - Only modify the SELECT projections to output the requested column(s) (while retaining any heading/label column if branches were unioned).
      * If the follow-up changes or narrows a filter, keep the previously selected columns and apply the new/updated filter to the same table.
-6. When the user asks for separate tables or subsets (such as highest and lowest values):
+7. When the user asks for separate tables or subsets (such as highest and lowest values):
    - You MUST use a UNION ALL query where the FIRST column in SELECT is named 'heading' (e.g., SELECT 'Highest Calories Burnt' AS heading, ... UNION ALL SELECT 'Least Calories Burnt' AS heading, ...) so the results can be grouped into separate named sections.
-7. Return JSON format:
+8. Return JSON format:
 {
   "status": "query" | "clarification_needed",
   "sql": "SELECT ...",
@@ -149,7 +154,71 @@ class SQLGenerator:
                 }
             }
 
-        # 2. Check for documentation inquiry
+        # 2. Check for direct table inspection queries (e.g. 'select * from table', 'select * from tablw', 'show all rows')
+        if re.search(r'^(?:select\s+\*\s+from\s+(?:the\s+)?(?:table|tablw|dataset|data)\s*;?|show\s+(?:all\s+)?(?:the\s+)?(?:rows|table|tablw|data|dataset)\s*;?)$', q_lower):
+            return {
+                "status": "query",
+                "sql": f'SELECT * FROM "{table_name}" LIMIT 50;',
+                "explanation": f"Selects records from the active table '{table_name}'.",
+                "clarification_question": None,
+                "diagnostics": {
+                    "mode": "rule_based",
+                    "llm_provider": None,
+                    "llm_model": None,
+                    "fresh_response": False,
+                    "prompt_summary": "Direct table inspection requested"
+                }
+            }
+
+        # 3. Check for user confirmation/affirmation following a clarification request
+        affirmation_phrases = {
+            "yes", "correct", "yes it is correct", "yeah", "yep", "sure", "ok", "confirm",
+            "yes please", "do it", "proceed", "right", "thats correct", "that is correct",
+            "yes correct", "yes exactly", "it is correct"
+        }
+        clean_q = re.sub(r'[^a-zA-Z0-9_\s]', '', q_lower).strip()
+        is_affirmation = (
+            clean_q in affirmation_phrases
+            or clean_q.startswith("yes ")
+            or "it is correct" in clean_q
+            or "thats correct" in clean_q
+            or (clean_q.startswith("yes") and table_name.lower() in clean_q)
+            or (clean_q.startswith("yes") and any(clean_q.endswith(table_name.lower()[:i]) for i in range(8, len(table_name) + 1)))
+        )
+
+        if is_affirmation and conversation_context:
+            prev_asst = conversation_context[-1] if conversation_context else None
+            prev_content = (prev_asst.get("content") or "").lower() if prev_asst else ""
+            if "clarif" in prev_content or "did you mean" in prev_content or "misspelled" in prev_content or "confirm" in prev_content:
+                orig_user_q = None
+                for m in reversed(conversation_context[:-1]):
+                    if m.get("role") == "user":
+                        orig_user_q = m.get("content", "")
+                        break
+                
+                if orig_user_q:
+                    if re.search(r'select\s+\*\s+from\s+(?:the\s+)?(?:table|tablw|dataset|data)', orig_user_q, re.I):
+                        return {
+                            "status": "query",
+                            "sql": f'SELECT * FROM "{table_name}" LIMIT 50;',
+                            "explanation": f"Confirmed query on table '{table_name}'.",
+                            "clarification_question": None,
+                            "diagnostics": {
+                                "mode": "rule_based",
+                                "llm_provider": None,
+                                "llm_model": None,
+                                "fresh_response": False,
+                                "prompt_summary": "Clarification confirmation resolved"
+                            }
+                        }
+                    question = re.sub(r'\b(the\s+)?(tablw|table|dataset|data)\b', table_name, orig_user_q, flags=re.I)
+                    q_lower = question.strip().lower()
+
+        # Correct obvious typos in question before sending to LLM
+        question = re.sub(r'\b(from\s+)(?:the\s+)?tablw\b', rf'\1"{table_name}"', question, flags=re.I)
+        q_lower = question.strip().lower()
+
+        # 4. Check for documentation inquiry
         doc_match = re.search(r'what does\s+([a-zA-Z0-9_]+)\s+mean', q_lower)
         if doc_match:
             col_target = doc_match.group(1)

@@ -303,9 +303,19 @@ class QueryOrchestrator:
 
         # Handle clarification needed
         if sql_plan.get("status") == "clarification_needed":
-            ans = sql_plan.get("explanation") or sql_plan.get("clarification_question") or "Clarification is needed before running this query."
-            clarification = sql_plan.get("clarification_question") or ans
-            asst_msg = Message(conversation_id=conversation_id, role="assistant", content=ans)
+            explanation = sql_plan.get("explanation") or "Clarification is needed before running this query."
+            clarification = sql_plan.get("clarification_question") or explanation
+            if clarification and clarification.lower() not in explanation.lower():
+                full_content = f"{explanation}\nClarification Required: {clarification}"
+            else:
+                full_content = explanation
+            ans = full_content
+            asst_msg = Message(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=full_content,
+                metadata_json={"clarification_question": clarification, "status": "clarification_needed"}
+            )
             db.add(asst_msg)
             db.commit()
             diag["final_status"] = "clarification_needed"
