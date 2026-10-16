@@ -18,7 +18,8 @@ InsightSQL is a conversational data analytics engine that translates natural lan
 
 ## Architecture
 
-![alt text](<Text-to-SQL Architecture Diagram.png>)
+<img width="1774" height="887" alt="Text-to-SQL Architecture Diagram" src="https://github.com/user-attachments/assets/24b960fa-8d4c-4ecf-9381-bac1a0cef69f" />
+
 
 ---
 
