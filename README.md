@@ -154,9 +154,3 @@ InsightSQL/
 ├── docker-compose.yml        # Multi-container orchestration
 └── README.md
 ```
-
----
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
