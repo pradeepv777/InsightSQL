@@ -283,58 +283,77 @@ class SQLGenerator:
             if llm_key.startswith("gsk_") or provider == "groq":
                 provider = "groq"
 
-            model_name = settings.LLM_MODEL
+            model_name = settings.LLM_MODEL or "openai/gpt-oss-20b"
             if provider == "groq" and (model_name == "gpt-4o-mini" or not model_name):
-                model_name = "openai/gpt-oss-120b"
+                model_name = "openai/gpt-oss-20b"
 
-            try:
-                if provider == "groq":
-                    try:
-                        from groq import Groq
-                        client = Groq(api_key=llm_key)
-                    except ImportError:
-                        from openai import OpenAI
-                        client = OpenAI(api_key=llm_key, base_url="https://api.groq.com/openai/v1")
-                else:
+            models_to_try = [model_name]
+            if provider == "groq":
+                if "120b" in model_name and "openai/gpt-oss-20b" not in models_to_try:
+                    models_to_try.append("openai/gpt-oss-20b")
+                elif "20b" in model_name and "openai/gpt-oss-120b" not in models_to_try:
+                    models_to_try.append("openai/gpt-oss-120b")
+
+            client = None
+            if provider == "groq":
+                try:
+                    from groq import Groq
+                    client = Groq(api_key=llm_key)
+                except ImportError:
                     from openai import OpenAI
-                    client = OpenAI(api_key=llm_key)
+                    client = OpenAI(api_key=llm_key, base_url="https://api.groq.com/openai/v1")
+            else:
+                from openai import OpenAI
+                client = OpenAI(api_key=llm_key)
 
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": SQL_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.0
-                )
+            last_error = None
+            for current_model in models_to_try:
+                try:
+                    response = client.chat.completions.create(
+                        model=current_model,
+                        messages=[
+                            {"role": "system", "content": SQL_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        response_format={"type": "json_object"},
+                        temperature=0.0
+                    )
 
-                content = response.choices[0].message.content
-                result = json.loads(content)
-                result["diagnostics"] = {
-                    "mode": "llm",
-                    "llm_provider": provider,
-                    "llm_model": model_name,
-                    "fresh_response": True,
-                    "prompt_summary": prompt_summary,
-                    "error": None
-                }
-                return result
-            except Exception as e:
-                logger.warning(
-                    "[%s] LLM call failed (provider=%s, model=%s, error=%s: %s). Falling back to dynamic analytical query engine.",
-                    req_id, provider, model_name, type(e).__name__, str(e)
-                )
-                fallback_res = cls._dynamic_analytical_generate(question, table_name, columns, conversation_context)
-                fallback_res["diagnostics"] = {
-                    "mode": "dynamic_analytical_fallback",
-                    "llm_provider": provider,
-                    "llm_model": model_name,
-                    "fresh_response": False,
-                    "prompt_summary": prompt_summary,
-                    "error": f"{type(e).__name__}: {str(e)}"
-                }
-                return fallback_res
+                    content = response.choices[0].message.content
+                    result = json.loads(content)
+                    result["diagnostics"] = {
+                        "mode": "llm",
+                        "llm_provider": provider,
+                        "llm_model": current_model,
+                        "fresh_response": True,
+                        "prompt_summary": prompt_summary,
+                        "error": None
+                    }
+                    return result
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "[%s] LLM call failed on model %s (provider=%s, error=%s: %s).",
+                        req_id, current_model, provider, type(e).__name__, str(e)
+                    )
+
+            logger.warning(
+                "[%s] All LLM models failed. Falling back to dynamic analytical query engine. Error: %s",
+                req_id, str(last_error)
+            )
+            fallback_res = cls._dynamic_analytical_generate(question, table_name, columns, conversation_context)
+            err_msg = f"{type(last_error).__name__}: {str(last_error)}" if last_error else "LLM unavailable"
+            fallback_res["diagnostics"] = {
+                "mode": "dynamic_analytical_fallback",
+                "llm_provider": provider,
+                "llm_model": model_name,
+                "fresh_response": False,
+                "prompt_summary": prompt_summary,
+                "error": err_msg
+            }
+            if fallback_res.get("explanation") == "Retrieved initial preview records from dataset.":
+                fallback_res["explanation"] = f"LLM rate limit reached ({type(last_error).__name__}). Defaulting to initial dataset preview."
+            return fallback_res
 
         # 4. Dynamic Schema-Driven Analytical Query Engine (Local / Offline mode)
         res = cls._dynamic_analytical_generate(question, table_name, columns, conversation_context)

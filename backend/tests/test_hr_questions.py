@@ -105,8 +105,8 @@ def test_question_5_attrition_by_overtime(hr_dataset_id):
     rate_col = next((c for c in res["columns"] if "attrition_rate" in c), None)
     assert rate_col is not None, f"Expected an attrition_rate column, got: {res['columns']}"
     # Overtime Yes: ~30.53%, Overtime No: ~10.44%
-    yes_row = next(r for r in res["rows"] if r[0] == "Yes")
-    no_row = next(r for r in res["rows"] if r[0] == "No")
+    yes_row = next(r for r in res["rows"] if str(r[0]).lower() in ("yes", "overtime"))
+    no_row = next(r for r in res["rows"] if str(r[0]).lower() in ("no", "no overtime"))
     rate_idx = res["columns"].index(rate_col)
     assert float(yes_row[rate_idx]) > float(no_row[rate_idx])
     assert res["visualization"] is not None
