@@ -12,11 +12,9 @@ class Settings(BaseSettings):
     READONLY_DATABASE_URL: Optional[str] = None
     
     # Model configuration
-    LLM_API_KEY: Optional[str] = os.getenv("LLM_API_KEY", None) or os.getenv("GROQ_API_KEY", None)
-    GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY", None)
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai")
-    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    LLM_API_KEY: Optional[str] = None
+    LLM_MODEL: str = "openai/gpt-oss-20b"
+    LLM_PROVIDER: str = "groq"
     
     # Safety and limits
     MAX_UPLOAD_MB: int = 100
@@ -28,5 +26,10 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"]
     
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if not self.LLM_API_KEY:
+            self.LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY")
 
 settings = Settings()

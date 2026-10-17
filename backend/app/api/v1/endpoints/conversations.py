@@ -37,6 +37,9 @@ def list_conversations(db: Session = Depends(get_db)):
 @router.get("/{conversation_id}/messages")
 def get_messages(conversation_id: str, db: Session = Depends(get_db)):
     """Retrieves message history for a conversation."""
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     msgs = db.query(Message).filter(Message.conversation_id == conversation_id).order_by(Message.created_at).all()
     return [
         {

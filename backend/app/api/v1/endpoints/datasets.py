@@ -9,6 +9,19 @@ from app.schemas.chat import DatasetResponse
 
 router = APIRouter()
 
+def _to_dataset_response(d: Dataset) -> DatasetResponse:
+    return DatasetResponse(
+        id=d.id,
+        display_name=d.display_name,
+        name=d.display_name,
+        source_filename=d.source_filename,
+        source_format=d.source_format,
+        status=d.status,
+        row_count=d.row_count,
+        created_at=str(d.created_at) if d.created_at else None,
+        error_summary=d.error_summary
+    )
+
 @router.post("", response_model=DatasetResponse)
 @router.post("/upload", response_model=DatasetResponse)
 async def upload_dataset(
@@ -23,17 +36,7 @@ async def upload_dataset(
             filename=file.filename,
             content=content
         )
-        return DatasetResponse(
-            id=dataset.id,
-            display_name=dataset.display_name,
-            name=dataset.display_name,
-            source_filename=dataset.source_filename,
-            source_format=dataset.source_format,
-            status=dataset.status,
-            row_count=dataset.row_count,
-            created_at=str(dataset.created_at) if dataset.created_at else None,
-            error_summary=dataset.error_summary
-        )
+        return _to_dataset_response(dataset)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -41,20 +44,7 @@ async def upload_dataset(
 def list_datasets(db: Session = Depends(get_db)):
     """Lists all uploaded datasets."""
     datasets = db.query(Dataset).order_by(Dataset.created_at.desc()).all()
-    return [
-        DatasetResponse(
-            id=d.id,
-            display_name=d.display_name,
-            name=d.display_name,
-            source_filename=d.source_filename,
-            source_format=d.source_format,
-            status=d.status,
-            row_count=d.row_count,
-            created_at=str(d.created_at) if d.created_at else None,
-            error_summary=d.error_summary
-        )
-        for d in datasets
-    ]
+    return [_to_dataset_response(d) for d in datasets]
 
 @router.get("/{dataset_id}", response_model=DatasetResponse)
 def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
@@ -62,17 +52,7 @@ def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    return DatasetResponse(
-        id=dataset.id,
-        display_name=dataset.display_name,
-        name=dataset.display_name,
-        source_filename=dataset.source_filename,
-        source_format=dataset.source_format,
-        status=dataset.status,
-        row_count=dataset.row_count,
-        created_at=str(dataset.created_at) if dataset.created_at else None,
-        error_summary=dataset.error_summary
-    )
+    return _to_dataset_response(dataset)
 
 @router.get("/{dataset_id}/preview")
 def preview_dataset(dataset_id: str, limit: int = 50, db: Session = Depends(get_db)):

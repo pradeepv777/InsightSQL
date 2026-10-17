@@ -11,7 +11,42 @@ from app.services.sql_generator import SQLGenerator
 from app.services.rag import RAGService
 from app.core.logging import log_diagnostic_event, logger
 
+def _format_cell_value(val: Any, col_name: str = "") -> str:
+    """Consolidated number and currency formatter for analytical summaries."""
+    if val is None:
+        return "N/A"
+    try:
+        num = float(val)
+        col = col_name.lower()
+        if any(k in col for k in ["income", "salary", "amount", "price", "revenue", "cost"]):
+            return f"${num:,.2f}"
+        if num.is_integer() and any(k in col for k in ["count", "total", "rows", "occurrences"]):
+            return f"{int(num):,}"
+        if "." in str(val):
+            return f"{num:,.2f}"
+        return f"{int(num):,}"
+    except (ValueError, TypeError):
+        return str(val)
+
 class QueryOrchestrator:
+    """
+    Core Pipeline Coordinator for InsightSQL.
+    
+    Architectural Lifecycle (12 Steps):
+      1. Session & History Persistence: Guarantees user message is saved before external calls.
+      2. Dataset Resolution: 5-tier fallback (explicit ID -> prior turn -> last SQL run -> schema match -> single ready dataset).
+      3. Fast-Path Optimization: Bypasses LLM/DB for precomputed metadata & data dictionary terms.
+      4. RAG Schema Retrieval: BM25 lexical ranking finds relevant table/column documentation.
+      5. Multi-Turn Context Assembly: Injects previous assistant turns AND their executed SQL.
+      6. LLM SQL Synthesis: Generates candidate query with deterministic JSON schema.
+      7. Clarification Routing: Detects genuine business ambiguities without guessing.
+      8. AST Security Sandboxing: sqlglot verifies single-SELECT, table allowlists, and no mutations.
+      9. Bounded PostgreSQL Execution: Dedicated query engine enforces 5000ms statement_timeout.
+     10. Runtime Self-Correction: Feeds Postgres runtime compiler errors back to LLM to auto-repair.
+     11. Result Synthesis & Section Splitting: Formats numbers, auto-configures charts, splits UNION headings.
+     12. Audit Trail & Diagnostics: Records QueryRun performance metrics and structured telemetry.
+    """
+
     @classmethod
     def process_message(
         cls,
@@ -24,7 +59,7 @@ class QueryOrchestrator:
         start_time = time.time()
         q_lower = question.strip().lower()
 
-        # Initialize diagnostic tracker for Step 3 safe diagnostic logging
+        # Telemetry tracker: captures pipeline state at each step for debugging and observability
         diag: Dict[str, Any] = {
             "request_id": request_id,
             "question": question,
@@ -46,14 +81,14 @@ class QueryOrchestrator:
             "final_status": "in_progress"
         }
         
-        # 1. Ensure conversation exists
+        # 1. Ensure conversation exists (creates an isolated thread if not already created)
         conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
         if not conv:
             conv = Conversation(id=conversation_id, title="Data Analysis")
             db.add(conv)
             db.commit()
 
-        # 2. Record User Message
+        # 2. Record User Message immediately (ensures user question is persisted even if subsequent LLM/DB calls crash)
         user_msg = Message(
             conversation_id=conversation_id,
             role="user",
@@ -62,12 +97,13 @@ class QueryOrchestrator:
         db.add(user_msg)
         db.commit()
 
-        # 3. Resolve active dataset
+        # 3. Resolve active dataset via 4-tier fallback hierarchy:
+        #    Tier A: Explicit dataset_ids passed by caller/frontend
         active_dataset = None
         if dataset_ids and len(dataset_ids) > 0:
             active_dataset = db.query(Dataset).filter(Dataset.id.in_(dataset_ids), Dataset.status == "ready").first()
 
-        # Check if conversation already has an active dataset from previous turns
+        #    Tier B: Conversational memory — inherit dataset from the preceding turn in this conversation
         if not active_dataset:
             last_msg_with_ds = db.query(Message).filter(
                 Message.conversation_id == conversation_id,
@@ -78,7 +114,7 @@ class QueryOrchestrator:
                 if prev_ds_id:
                     active_dataset = db.query(Dataset).filter(Dataset.id == prev_ds_id, Dataset.status == "ready").first()
 
-        # If still no dataset, check recent QueryRuns for this conversation
+        #    Tier C: Recent QueryRun history — inspect the table name executed in the last successful query
         if not active_dataset:
             last_qr = db.query(QueryRun).filter(
                 QueryRun.conversation_id == conversation_id,
@@ -93,9 +129,8 @@ class QueryOrchestrator:
                     if active_dataset:
                         break
 
-        # If no explicit or historical dataset was selected, find the ready dataset whose schema columns best match the question
+        #    Tier D: Schema lexical matching — score ready datasets by column name occurrences in the user prompt
         if not active_dataset:
-            import re
             all_ready = db.query(Dataset).filter(Dataset.status == "ready").order_by(Dataset.created_at.desc()).all()
             if all_ready:
                 best_dataset = None
@@ -114,8 +149,8 @@ class QueryOrchestrator:
                 if best_dataset and best_match_count >= 2:
                     active_dataset = best_dataset
 
+        #    Tier E: Default to the most recently uploaded ready dataset
         if not active_dataset:
-            # Pick the most recently imported ready dataset
             active_dataset = db.query(Dataset).filter(Dataset.status == "ready").order_by(Dataset.created_at.desc()).first()
 
         if not active_dataset:
@@ -186,7 +221,8 @@ class QueryOrchestrator:
             col_list = [{"name": c.column_name, "type": c.database_type} for c in columns_meta]
             multi_table_schema = None
 
-        # 4. Check for direct metadata profile questions
+        # 4. Fast-Path Optimization: Check for direct metadata profile questions.
+        #    Bypasses LLM token spend and DB latency by reading cached ingestion profiles.
         if "how many rows and columns" in q_lower or ("rows and columns" in q_lower and "how many" in q_lower):
             ans = f"The dataset '{active_dataset.display_name}' contains {ds_table.row_count:,} rows and {len(col_list)} columns: {', '.join([c['name'] for c in col_list])}."
             asst_msg = Message(conversation_id=conversation_id, role="assistant", content=ans)
@@ -208,6 +244,7 @@ class QueryOrchestrator:
                 "warnings": []
             }
 
+        # Fast-Path: Missing-value profiles cached during ingestion in ColumnMetadata.profile_json
         if "missing-value counts" in q_lower or "missing value" in q_lower or "null count" in q_lower or "show missing" in q_lower:
             rows = []
             for col in columns_meta:
@@ -234,7 +271,7 @@ class QueryOrchestrator:
                 "warnings": []
             }
 
-        # 5. Check for documentation inquiry using RAG
+        # 5. Fast-Path: Data dictionary lookup via RAG business definitions (e.g., "what does attrition mean?")
         if "what does" in q_lower and "mean" in q_lower:
             target = q_lower.replace("what does", "").replace("mean", "").strip().strip("`'\"? ")
             col_def = RAGService.get_column_definition(db, target, [active_dataset.id])
@@ -261,7 +298,8 @@ class QueryOrchestrator:
                 "warnings": []
             }
 
-        # 6. Retrieve relevant RAG context
+        # 6. RAG Context Retrieval: Lexically indexes schemas and business definitions via BM25,
+        #    strictly filtered to the authorized active dataset to ground the LLM prompt.
         retrieved_docs = RAGService.retrieve_context(db, question, [active_dataset.id], top_k=4)
         diag["retrieved_docs"] = [
             {"id": str(d.get("id")), "score": d.get("score"), "type": d.get("type")}
@@ -269,7 +307,9 @@ class QueryOrchestrator:
         ]
         rag_context = [d["content"] for d in retrieved_docs]
 
-        # 7. Load recent conversation history (excluding current message)
+        # 7. Multi-Turn Context Assembly: Load the last 6 messages.
+        #    Crucial: Attaches previously executed SQL to assistant messages so follow-up queries
+        #    (e.g., "now only show calories", "filter to Hyderabad") preserve previous CTEs and WHERE clauses.
         recent_messages = db.query(Message).filter(
             Message.conversation_id == conversation_id,
             Message.id != user_msg.id
@@ -282,7 +322,8 @@ class QueryOrchestrator:
                 entry["sql"] = m.metadata_json["sql"]
             conv_context.append(entry)
 
-        # 8. Generate SQL
+        # 8. SQL Generation: Calls Groq/OpenAI with schema, context, and conversation turns.
+        #    Falls back to deterministic rule-based engine if offline or rate-limited.
         sql_plan = SQLGenerator.generate_sql(
             question=question,
             table_name=table_name,
@@ -301,7 +342,8 @@ class QueryOrchestrator:
         diag["generation_mode"] = plan_diag.get("mode", "unknown")
         diag["proposed_sql"] = sql_plan.get("sql")
 
-        # Handle clarification needed
+        # 8a. Clarification Guardrail: If query is genuinely ambiguous (e.g. unspecified fiscal quarter),
+        #     ask user politely rather than guessing and returning misleading analytical numbers.
         if sql_plan.get("status") == "clarification_needed":
             explanation = sql_plan.get("explanation") or "Clarification is needed before running this query."
             clarification = sql_plan.get("clarification_question") or explanation
@@ -338,13 +380,17 @@ class QueryOrchestrator:
         proposed_sql = sql_plan.get("sql")
         explanation = sql_plan.get("explanation", "Executed analytical query.")
 
-        # 9. Validate SQL against strict security policy
+        # 9. AST Security Sandboxing: Validates query against strict policies using sqlglot:
+        #    - Restricts to a solitary SELECT statement (blocks DDL/DML, semicolon-chained attacks).
+        #    - Blocks system schemas (pg_catalog, information_schema).
+        #    - Restricts table access solely to tables in `allowed_tables`.
         validated_sql = None
         try:
             validated_sql = SQLPolicyValidator.validate_and_format(proposed_sql, allowed_tables)
             diag["sql_validation"] = "passed"
         except SQLPolicyError as spe:
-            # If LLM proposed invalid SQL or an unauthorized table in a follow-up, try dynamic analytical generator
+            # Fallback resilience: If the LLM hallucinated an invalid syntax or unauthorized table,
+            # attempt generation via the deterministic dynamic analytical query engine.
             if diag.get("generation_mode") == "llm":
                 logger.warning(
                     f"LLM generated query was rejected ({spe.message}). Attempting dynamic analytical fallback."
@@ -361,6 +407,7 @@ class QueryOrchestrator:
                 except Exception:
                     validated_sql = None
 
+            # If still rejected after fallback, record policy failure audit trail and return polite alert
             if not validated_sql:
                 diag["sql_validation"] = f"rejected: {spe.message}"
                 diag["final_status"] = "rejected"
@@ -402,7 +449,8 @@ class QueryOrchestrator:
                     "warnings": [spe.message]
                 }
 
-        # 10. Execute query safely with read-only connection & statement timeout
+        # 10. Bounded Execution & LLM Self-Correction Loop
+        #     Uses dedicated `query_engine` configured with PostgreSQL session-level statement_timeout (5000ms).
         exec_start = time.time()
         diag["queried_postgres"] = True
         current_sql = validated_sql
@@ -410,7 +458,10 @@ class QueryOrchestrator:
         max_exec_retries = 1 if str(diag.get("generation_mode", "")).startswith("llm") else 0
 
         def _is_retryable_exec_error(err_str: str) -> bool:
-            """Skip self-correction for timeouts/cancellations to keep latency bounded."""
+            """
+            Latency optimization: Skip self-correction retries for timeouts or client cancellations.
+            If a query ran for 5000ms and timed out, repeating it would only waste more latency.
+            """
             lowered = err_str.lower()
             return not ("canceling statement" in lowered or "statement_timeout" in lowered)
 
@@ -439,8 +490,10 @@ class QueryOrchestrator:
                         or not _is_retryable_exec_error(exec_last_error)
                     ):
                         raise
-                    # Execution failed but policy passed -> LLM self-correction loop.
-                    # Re-prompt with the exact PostgreSQL error (root-cause grounded repair).
+
+                    # Runtime Self-Correction: Query passed policy checks but PostgreSQL threw a runtime error
+                    # (e.g., column missing from CTE projection, type mismatch, ambiguous alias).
+                    # Re-prompts the LLM with the exact Postgres error for root-cause grounded repair.
                     if attempt == 0:
                         logger.warning(
                             "[%s] SQL execution failed (%s). Attempting LLM execution self-correction.",
@@ -460,9 +513,10 @@ class QueryOrchestrator:
                     rep_status = repair_plan.get("status")
                     diag["execution_repair_status"] = rep_status
                     if not rep_status or not rep_sql:
-                        # unfixable / no_llm / repair_failed -> surface original failure
+                        # Unfixable / repair failed: surface original exception
                         raise exec_err
-                    # Repaired SQL must satisfy the same security policy before execution
+
+                    # Security Enforcement: Repaired SQL must pass AST validation again before running!
                     current_sql = SQLPolicyValidator.validate_and_format(rep_sql, allowed_tables)
                     diag["execution_repair_attempted"] = True
                     diag["repaired_sql"] = current_sql
@@ -514,89 +568,33 @@ class QueryOrchestrator:
             summary = f"{explanation} The query completed successfully, but returned 0 rows."
 
         elif row_cnt == 1 and len(cols) == 1:
-            val = formatted_rows[0][0]
             col_name = cols[0].lower()
-            
-            # Format count / employee totals
-            if "employee" in col_name or "count" in col_name or "rows" in col_name or "occurrences" in col_name:
-                try:
-                    num_val = int(val)
-                    if "left" in col_name or "attrition" in q_lower:
-                        summary = f"**{num_val:,}** employees left the company (attrition = 'Yes')."
-                    elif "employee" in col_name or "total" in col_name:
-                        summary = f"There are **{num_val:,}** employees in this dataset."
-                    else:
-                        summary = f"{explanation} Result: **{num_val:,}**."
-                except (ValueError, TypeError):
-                    summary = f"{explanation} Result: **{val}**."
-            # Format monetary amounts or averages
-            elif any(k in col_name for k in ["income", "salary", "amount", "price", "revenue", "avg", "cost"]):
-                try:
-                    num_val = float(val)
-                    summary = f"{explanation} Result: **${num_val:,.2f}**."
-                except (ValueError, TypeError):
-                    summary = f"{explanation} Result: **{val}**."
+            fmt = _format_cell_value(formatted_rows[0][0], cols[0])
+            if any(k in col_name for k in ["count", "total", "rows", "matching"]):
+                summary = f"There are **{fmt}** records matching your query."
             else:
-                summary = f"{explanation} Result: **{val}** ({cols[0]})."
+                summary = f"{explanation} Result: **{fmt}**."
 
-        elif any("attrition_rate" in c for c in cols):
-            # Specific rate comparison breakdown across groups (column name agnostic)
-            rate_col_name = next(c for c in cols if "attrition_rate" in c)
-            rate_idx = cols.index(rate_col_name)
-            tot_idx = cols.index("total_employees") if "total_employees" in cols else None
-            cnt_idx = cols.index("attrition_count") if "attrition_count" in cols else None
-            group_name = cols[0].replace("_", " ").title()
-
-            # Optional secondary metric column (e.g. avg_monthly_income) shown with the rate
-            metric_idx = None
-            for i, c in enumerate(cols):
-                if i in (0, rate_idx) or c in ("total_employees", "attrition_count"):
-                    continue
-                if any(k in c.lower() for k in ["avg", "income", "salary", "amount", "value", "cost"]):
-                    metric_idx = i
-                    break
-
-            def _fmt_metric(raw):
-                try:
-                    return f"${float(raw):,.2f}"
-                except (ValueError, TypeError):
-                    return str(raw) if raw is not None else "N/A"
+        elif any(k in c.lower() for c in cols for k in ["rate", "pct", "percent"]):
+            rate_col = next(c for c in cols if any(k in c.lower() for k in ["rate", "pct", "percent"]))
+            rate_idx = cols.index(rate_col)
+            tot_idx = next((i for i, c in enumerate(cols) if any(k in c.lower() for k in ["total", "count", "rows"]) and i != rate_idx), None)
+            cnt_idx = next((i for i, c in enumerate(cols) if any(k in c.lower() for k in ["count", "events", "positives", "matching"]) and i not in (0, rate_idx, tot_idx)), None)
+            metric_idx = next((i for i, c in enumerate(cols) if i not in (0, rate_idx, tot_idx, cnt_idx) and any(k in c.lower() for k in ["avg", "income", "salary", "amount", "cost"])), None)
 
             lines = [f"{explanation}"]
             for r in formatted_rows:
-                grp = r[0]
-                pct = r[rate_idx]
+                base = f"- **{r[0]}**: {r[rate_idx]}%"
                 if tot_idx is not None and cnt_idx is not None:
-                    tot = r[tot_idx]
-                    cnt = r[cnt_idx]
-                    base = f"- **{grp}**: {pct}% ({cnt} left out of {tot} employees)"
-                else:
-                    base = f"- **{grp}**: {pct}%"
+                    base += f" ({r[cnt_idx]} out of {r[tot_idx]})"
                 if metric_idx is not None:
-                    metric_label = cols[metric_idx].replace("_", " ")
-                    base = f"{base} with {metric_label}: {_fmt_metric(r[metric_idx])}"
+                    base += f" with {cols[metric_idx].replace('_', ' ')}: {_format_cell_value(r[metric_idx], cols[metric_idx])}"
                 lines.append(base)
             summary = "\n".join(lines)
-
-            visualization = {
-                "type": "bar",
-                "x": cols[0],
-                "y": rate_col_name
-            }
+            visualization = {"type": "bar", "x": cols[0], "y": rate_col}
 
         elif row_cnt <= 5 and len(cols) == 2:
-            items = []
-            for r in formatted_rows:
-                val_raw = str(r[1]) if r[1] is not None else ""
-                try:
-                    num_val = float(val_raw)
-                    if "." in val_raw:
-                        num_fmt = f"{num_val:,.2f}"
-                    else:
-                        num_fmt = f"{int(num_val):,}"
-                except (ValueError, TypeError):
-                    num_fmt = val_raw
-                items.append(f"{r[0]}: {num_fmt}")
+            items = [f"{r[0]}: {_format_cell_value(r[1], cols[1])}" for r in formatted_rows]
             summary = f"{explanation} Found: {', '.join(items)}."
             try:
                 float(formatted_rows[0][1])
@@ -620,7 +618,11 @@ class QueryOrchestrator:
         else:
             summary = f"{explanation} Returned {row_cnt:,} record{'s' if row_cnt != 1 else ''}."
 
-        # Check for multiple named result sections (e.g. if query has a heading column from UNION or categories)
+        # 11b. Multi-Section Splitting:
+        #      When a user asks for separate tables or comparisons (e.g. "Highest and Lowest Calories Burnt"),
+        #      the SQL query generates a UNION ALL with a 'heading' column.
+        #      The orchestrator detects this column, removes it from tabular columns, and splits rows
+        #      into distinct named subsections so the frontend renders separate cards/tables.
         sections = None
         if cols and len(cols) > 1:
             heading_col_idx = None
@@ -668,7 +670,10 @@ class QueryOrchestrator:
                             "row_count": len(sub_rows)
                         })
 
-        # 12. Save Assistant Message and Query Run
+        # 12. Audit Trail Persistence:
+        #     - Message: Appends assistant response and metadata (SQL, row count, execution_ms).
+        #     - QueryRun: Independent audit record of every generated query with execution time and status.
+        #     - Telemetry: Emits sanitized JSON diagnostic events (credentials redacted).
         safe_content = summary or "Executed analytical query."
         asst_msg = Message(
             conversation_id=conversation_id,

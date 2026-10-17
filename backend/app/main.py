@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import engine, Base
 import app.models.models
-import app.core.logging
 from app.api.v1.endpoints import datasets, conversations, health
 
 # Create application metadata tables on startup

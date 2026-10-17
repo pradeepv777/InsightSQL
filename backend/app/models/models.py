@@ -1,6 +1,5 @@
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
 from sqlalchemy import Column, String, Integer, DateTime, Boolean, Text, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -63,7 +62,6 @@ class RetrievalDocument(Base):
     document_type = Column(String(50), nullable=False) # table_schema, column_description, business_definition, sql_example
     content = Column(Text, nullable=False)
     metadata_json = Column(JSON, nullable=True)
-    embedding_json = Column(JSON, nullable=True) # JSON array of floats for portable similarity across any Postgres instance
     created_at = Column(DateTime, default=utc_now)
     
     dataset = relationship("Dataset", back_populates="documents")

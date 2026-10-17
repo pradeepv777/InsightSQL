@@ -20,16 +20,16 @@ Rules:
      * You MUST NOT ask for clarification again.
      * You MUST immediately accept the confirmation, resolve the question to the clarified entity/table, and generate the final SELECT query.
 6. Multi-turn Follow-up Handling:
-   - When conversation history is present and the user asks a follow-up request (e.g., "only calories column", "now only show X", "filter to Y", "order by Z", "also include W"):
+   - When conversation history is present and the user asks a follow-up request (e.g., "only <column> column", "now only show X", "filter to Y", "order by Z", "also include W"):
      * ALWAYS preserve the previous query's core logic, filters, calculations, subqueries, and table references.
      * Treat follow-ups as natural conversational refinements, NEVER as a conflict. Do NOT ask for clarification when modifying columns or filters.
-     * If the follow-up specifies a subset of columns (e.g. "only calories column"):
-       - NEVER revert to an unfiltered table dump (like SELECT calories FROM table).
+     * If the follow-up specifies a subset of columns (e.g. "only salary column", "only calories column"):
+       - NEVER revert to an unfiltered table dump (like SELECT col FROM table).
        - You MUST keep all CTEs, WHERE filters, MAX/MIN subqueries, and UNION ALL branches from the previous query in history.
        - Only modify the SELECT projections to output the requested column(s) (while retaining any heading/label column if branches were unioned).
      * If the follow-up changes or narrows a filter, keep the previously selected columns and apply the new/updated filter to the same table.
 7. When the user asks for separate tables or subsets (such as highest and lowest values):
-   - You MUST use a UNION ALL query where the FIRST column in SELECT is named 'heading' (e.g., SELECT 'Highest Calories Burnt' AS heading, ... UNION ALL SELECT 'Least Calories Burnt' AS heading, ...) so the results can be grouped into separate named sections.
+   - You MUST use a UNION ALL query where the FIRST column in SELECT is named 'heading' (e.g., SELECT 'Highest <Metric>' AS heading, ... UNION ALL SELECT 'Lowest <Metric>' AS heading, ...) so the results can be grouped into separate named sections.
 8. Return JSON format:
 {
   "status": "query" | "clarification_needed",
@@ -62,10 +62,17 @@ Return JSON format:
 }
 """
 
-def _transform_sql_to_only_column(sql: str, target_col: str, fallback_table: Optional[str] = None) -> Optional[str]:
+def _transform_sql_to_only_column(sql: str, target_col: str) -> Optional[str]:
     """
-    Safely modifies an existing SQL query to project only target_col (and any heading/label column),
-    preserving all CTEs, WHERE filters, subqueries, and UNION branches.
+    AST Query Transformer for Conversational Column Refinements (e.g. 'only calories column').
+    
+    Why this is technically hard and requires AST manipulation:
+      - If the user previously asked for 'highest and lowest calories', the previous SQL query
+        contains CTEs, WHERE subqueries, and UNION ALL branches.
+      - A naive approach would generate `SELECT calories FROM table` (destroying all previous filters!).
+      - This helper parses the existing query with `sqlglot`, finds only top-level SELECT projections
+        (ignoring subqueries inside WHERE or CTE definitions), preserves section heading aliases,
+        and swaps the data columns for the requested `target_col`.
     """
     try:
         parsed = sqlglot.parse_one(sql, read="postgres")
@@ -75,7 +82,7 @@ def _transform_sql_to_only_column(sql: str, target_col: str, fallback_table: Opt
         }
         
         for select in parsed.find_all(exp.Select):
-            # Do not touch subqueries inside WHERE clauses or CTE definitions
+            # Skip inner subqueries inside WHERE clauses or CTE definitions to preserve their internal logic
             curr = select.parent
             is_inner = False
             while curr:
@@ -89,7 +96,7 @@ def _transform_sql_to_only_column(sql: str, target_col: str, fallback_table: Opt
             new_selects = []
             for e in select.expressions:
                 alias = e.alias_or_name.lower()
-                # Retain heading / title / label expression if present
+                # Retain heading / title / label expressions so multi-section UI grouping remains intact
                 if alias in heading_names or (isinstance(e, exp.Alias) and isinstance(e.this, exp.Literal)) or any(alias.endswith(s) for s in ["_heading", "_label", "_section", "_title"]):
                     new_selects.append(e)
                 elif isinstance(e, exp.Literal) and not e.is_number:
@@ -119,6 +126,13 @@ def _transform_sql_to_only_column(sql: str, target_col: str, fallback_table: Opt
         return None
 
 class SQLGenerator:
+    """
+    Natural Language to PostgreSQL Query Generation Engine.
+    
+    Integrates Groq LPU inference (ultra-low latency open-weights models) or OpenAI,
+    backed by a deterministic dynamic analytical query engine when offline.
+    """
+
     @classmethod
     def generate_sql(
         cls,
@@ -131,9 +145,12 @@ class SQLGenerator:
         schema_override: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Translates a natural language question into PostgreSQL SQL.
-        Uses LLM (OpenAI or Groq) when configured, with a dynamic schema-aware
-        analytical query engine when offline or without an API key.
+        Translates a natural language question into PostgreSQL SQL:
+          1. Detects business ambiguities requiring clarification.
+          2. Recognizes user confirmations (e.g. 'yes', 'confirm') after clarification.
+          3. Formats prompt with Schema, RAG Context, and Conversation History (including past SQL).
+          4. Calls Groq/OpenAI with temperature=0.0 and JSON mode enforcement.
+          5. Falls back to dynamic analytical engine if LLM fails or API key is absent.
         """
         q_lower = question.strip().lower()
         req_id = request_id or "local"
@@ -155,6 +172,7 @@ class SQLGenerator:
             }
 
         # 2. Check for direct table inspection queries (e.g. 'select * from table', 'select * from tablw', 'show all rows')
+        # tablw - delibrate mistake 
         if re.search(r'^(?:select\s+\*\s+from\s+(?:the\s+)?(?:table|tablw|dataset|data)\s*;?|show\s+(?:all\s+)?(?:the\s+)?(?:rows|table|tablw|data|dataset)\s*;?)$', q_lower):
             return {
                 "status": "query",
@@ -218,25 +236,6 @@ class SQLGenerator:
         question = re.sub(r'\b(from\s+)(?:the\s+)?tablw\b', rf'\1"{table_name}"', question, flags=re.I)
         q_lower = question.strip().lower()
 
-        # 4. Check for documentation inquiry
-        doc_match = re.search(r'what does\s+([a-zA-Z0-9_]+)\s+mean', q_lower)
-        if doc_match:
-            col_target = doc_match.group(1)
-            return {
-                "status": "documentation",
-                "target_column": col_target,
-                "sql": None,
-                "explanation": f"Documentation inquiry for column '{col_target}'.",
-                "clarification_question": None,
-                "diagnostics": {
-                    "mode": "rule_based",
-                    "llm_provider": None,
-                    "llm_model": None,
-                    "fresh_response": False,
-                    "prompt_summary": "Documentation lookup triggered"
-                }
-            }
-
         # 3. Check if LLM API is available and configured
         llm_key = settings.LLM_API_KEY
         
@@ -284,9 +283,6 @@ class SQLGenerator:
                 provider = "groq"
 
             model_name = settings.LLM_MODEL or "openai/gpt-oss-20b"
-            if provider == "groq" and (model_name == "gpt-4o-mini" or not model_name):
-                model_name = "openai/gpt-oss-20b"
-
             models_to_try = [model_name]
             if provider == "groq":
                 if "120b" in model_name and "openai/gpt-oss-20b" not in models_to_try:
@@ -380,9 +376,17 @@ class SQLGenerator:
         schema_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Self-correction loop: re-prompts the LLM with the original question, the
-        failed SQL, and the exact PostgreSQL error, returning a repaired query.
-        Returns status "repaired" (with SQL), "unfixable", "no_llm", or "repair_failed".
+        Automated Self-Correction Engine (Feedback-Driven Query Repair):
+          - LLMs occasionally hallucinate a non-existent column, miss a CTE projection, or
+            produce a datatype mismatch (e.g. comparing string to int).
+          - Rather than failing the user request, this method re-prompts the model using
+            `SQL_REPAIR_SYSTEM_PROMPT` containing:
+              1. The original question
+              2. The exact table schema
+              3. The failed SQL query
+              4. The exact PostgreSQL runtime error message
+          - Returns status: "repaired" with the corrected SQL, or "unfixable" if the needed
+            attribute is fundamentally absent from the schema.
         """
         req_id = request_id or "local"
         llm_key = settings.LLM_API_KEY
@@ -410,15 +414,7 @@ class SQLGenerator:
             schema_desc = f"Table: {table_name}\nColumns:\n" + "\n".join(
                 [f"- {c['name']} ({c['type']})" for c in columns]
             )
-        history_lines = []
-        for m in (conversation_context or []):
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            sql = m.get("sql")
-            if sql:
-                history_lines.append(f"{role}: {content}")
-            else:
-                history_lines.append(f"{role}: {content}")
+        history_lines = [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in (conversation_context or [])]
         history_str = "\n".join(history_lines)
 
         repair_prompt = (
@@ -434,9 +430,7 @@ class SQLGenerator:
         if llm_key.startswith("gsk_") or provider == "groq":
             provider = "groq"
 
-        model_name = settings.LLM_MODEL
-        if provider == "groq" and (model_name == "gpt-4o-mini" or not model_name):
-            model_name = "openai/gpt-oss-120b"
+        model_name = settings.LLM_MODEL or "openai/gpt-oss-120b"
 
         try:
             if provider == "groq":
@@ -507,9 +501,15 @@ class SQLGenerator:
         conversation_context: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
         """
-        Dynamically analyzes schema and user question to construct correct, validated SQL.
-        Handles counts, filtered counts, aggregations, rate comparisons, group breakdowns,
-        rankings, duplicates, and conversation follow-ups.
+        Deterministic Dynamic Analytical SQL Engine (Offline / Fallback Mode).
+        
+        Analyzes the column names, datatypes, and conversational intent to construct
+        syntactically correct, validated PostgreSQL queries without requiring an active LLM:
+          - Multi-turn column projection refinements (preserving previous CTEs/WHERE clauses)
+          - Filter updates (comparison operators >=, <=, >, <, =, !=)
+          - Highest / lowest boundary records using UNION ALL with section headings
+          - Dimension rate comparisons with conditional aggregation (`COUNT(*) FILTER (...)`)
+          - Averages, top-K rankings, duplicate detections, and temporal grouping (`TO_CHAR`)
         """
         q = question.strip().lower()
         col_names = [c["name"].lower() for c in columns]
@@ -529,8 +529,6 @@ class SQLGenerator:
                 num_cols = [c["name"] for c in columns if any(t in c["type"].lower() for t in ["int", "double", "float", "numeric", "bigint"])]
                 return num_cols[0] if num_cols else columns[0]["name"]
             return None
-
-        attrition_col = find_col(["attrition", "churn", "left", "turnover"])
 
         # 1. Follow-up query resolution using conversation history
         is_filter_change = any(w in q for w in ["filter to", "filter by", "where", "change filter"]) or bool(re.search(r'[a-zA-Z_]+\s*(>=|<=|>|<|=|!=)\s*[0-9.]+', q))
@@ -626,19 +624,33 @@ class SQLGenerator:
                     "clarification_question": None
                 }
 
-        if ("higher attrition" in q or "previous comparison" in q or "that group" in q) and conversation_context:
-            history_text = " ".join([m.get("content", "").lower() for m in conversation_context])
-            income_col = find_col(["monthlyincome", "income", "salary", "wage", "pay"], prefer_numeric=True)
-            if "overtime" in history_text or "overtime" in q:
-                overtime_col = find_col(["overtime"])
-                if overtime_col and income_col:
-                    sql = f'SELECT ROUND(AVG("{income_col}")::numeric, 2) AS avg_{income_col} FROM "{table_name}" WHERE LOWER("{overtime_col}") = \'yes\';'
-                    return {
-                        "status": "query",
-                        "sql": sql,
-                        "explanation": f"Calculated the average {income_col} for employees who work overtime (the group with higher attrition rate: 30.53%).",
-                        "clarification_question": None
-                    }
+        if conversation_context and (
+            re.search(r"\b(higher|highest|lower|lowest)\b", q) or
+            any(w in q for w in ["previous comparison", "that group", "higher rate", "highest rate"])
+        ):
+            last_sql = next((m.get("sql") for m in reversed(conversation_context) if m.get("sql")), "")
+            group_match = re.search(r'GROUP BY\s+"?([A-Za-z0-9_]+)"?', last_sql, re.IGNORECASE)
+            prev_group_col = group_match.group(1) if group_match else None
+            
+            metric_col = next((col_map[c] for c in col_names if c in q and c != (prev_group_col or '').lower()), None)
+            if not metric_col:
+                metric_col = find_col(["income", "salary", "amount", "price", "sales", "revenue", "value", "cost"], prefer_numeric=True)
+
+            if prev_group_col and metric_col:
+                sql = (
+                    f'SELECT ROUND(AVG("{metric_col}")::numeric, 2) AS avg_{metric_col} '
+                    f'FROM "{table_name}" '
+                    f'WHERE "{prev_group_col}" = ('
+                    f'SELECT "{prev_group_col}" FROM "{table_name}" '
+                    f'GROUP BY "{prev_group_col}" '
+                    f'ORDER BY COUNT(*) DESC LIMIT 1);'
+                )
+                return {
+                    "status": "query",
+                    "sql": sql,
+                    "explanation": f"Calculated the average {metric_col} for the leading group from previous comparison.",
+                    "clarification_question": None
+                }
 
         # 1c. Highest and lowest / Maximum and minimum non-null rows
         if (any(h in q for h in ["highest", "max", "maximum", "most"]) and any(l in q for l in ["lowest", "min", "minimum", "least"])) or ("highest and lowest" in q):
@@ -652,10 +664,10 @@ class SQLGenerator:
             
             if target_metric:
                 sql = (
-                    f"SELECT 'Highest {target_metric.title()} Burnt' AS heading, * FROM \"{table_name}\" "
+                    f"SELECT 'Highest {target_metric.title()}' AS heading, * FROM \"{table_name}\" "
                     f"WHERE \"{target_metric}\" = (SELECT MAX(\"{target_metric}\") FROM \"{table_name}\" WHERE \"{target_metric}\" IS NOT NULL) "
                     f"UNION ALL "
-                    f"SELECT 'Least {target_metric.title()} Burnt' AS heading, * FROM \"{table_name}\" "
+                    f"SELECT 'Least {target_metric.title()}' AS heading, * FROM \"{table_name}\" "
                     f"WHERE \"{target_metric}\" = (SELECT MIN(\"{target_metric}\") FROM \"{table_name}\" WHERE \"{target_metric}\" IS NOT NULL);"
                 )
                 return {
@@ -665,72 +677,67 @@ class SQLGenerator:
                     "clarification_question": None
                 }
 
-        # 2. Rate comparisons / Breakdown by dimension (e.g. "Compare attrition rates across departments", "between employees who work overtime")
-        if ("compare" in q or "rate" in q or "rates" in q or "breakdown" in q or "by" in q) and ("attrition" in q or "left" in q or "turnover" in q):
-            group_col = None
-            if "department" in q:
-                group_col = find_col(["department", "dept"])
-            elif "overtime" in q:
-                group_col = find_col(["overtime"])
-            elif "role" in q or "job" in q:
-                group_col = find_col(["jobrole", "role"])
-            elif "gender" in q:
-                group_col = find_col(["gender"])
-            elif "education" in q:
-                group_col = find_col(["educationfield", "education"])
-            else:
-                for c in col_names:
-                    if len(c) > 3 and c in q and (not attrition_col or c != attrition_col.lower()):
-                        group_col = col_map[c]
-                        break
+        # 2. Rate comparisons / Breakdown by dimension (e.g. "Compare rate across <dimension>")
+        if any(w in q for w in ["compare", "rate", "rates", "breakdown", "proportion", "percentage"]):
+            group_col = next((col_map[c] for c in col_names if len(c) > 2 and c in q), None)
+            target_col = next((col_map[c] for c in col_names if len(c) > 2 and c in q and c != (group_col or '').lower()), None)
+            
+            if not group_col and target_col:
+                group_col = next((col_map[c] for c in col_names if c != target_col.lower() and not any(t in c for t in ["id", "date"])), None)
 
-            if group_col and attrition_col:
+            if group_col and target_col:
+                rate_alias = f"{target_col.lower()}_rate_pct"
+                cnt_alias = f"{target_col.lower()}_count"
                 sql = (
                     f'SELECT "{group_col}", '
-                    f'COUNT(*) AS total_employees, '
-                    f'COUNT(*) FILTER (WHERE LOWER("{attrition_col}") = \'yes\') AS attrition_count, '
-                    f'ROUND(COUNT(*) FILTER (WHERE LOWER("{attrition_col}") = \'yes\') * 100.0 / NULLIF(COUNT(*), 0), 2) AS attrition_rate_pct '
+                    f'COUNT(*) AS total_records, '
+                    f'COUNT(*) FILTER (WHERE LOWER(CAST("{target_col}" AS text)) IN (\'yes\', \'true\', \'1\', \'y\')) AS {cnt_alias}, '
+                    f'ROUND(COUNT(*) FILTER (WHERE LOWER(CAST("{target_col}" AS text)) IN (\'yes\', \'true\', \'1\', \'y\')) * 100.0 / NULLIF(COUNT(*), 0), 2) AS {rate_alias} '
                     f'FROM "{table_name}" '
                     f'GROUP BY "{group_col}" '
-                    f'ORDER BY attrition_rate_pct DESC;'
+                    f'ORDER BY {rate_alias} DESC;'
                 )
                 return {
                     "status": "query",
                     "sql": sql,
-                    "explanation": f"Compared attrition rates across {group_col}.",
+                    "explanation": f"Compared {target_col} rates across {group_col}.",
                     "clarification_question": None
                 }
 
-        # 3. Average / Aggregation with filter (e.g. "What is the average monthly income of employees who left?")
-        if ("average" in q or "avg" in q or "mean" in q) and ("who left" in q or "left the company" in q or "attrition = yes" in q or "attrition" in q or "who resigned" in q):
-            val_col = find_col(["monthlyincome", "income", "salary", "order_value", "total", "amount", "price", "sales", "val", "cost", "revenue"], prefer_numeric=True)
-            if attrition_col and val_col:
-                sql = f'SELECT ROUND(AVG("{val_col}")::numeric, 2) AS avg_{val_col} FROM "{table_name}" WHERE LOWER("{attrition_col}") = \'yes\';'
+        # 3. Average / Aggregation with filter (e.g. "What is the average <metric> of records where ...")
+        if any(w in q for w in ["average", "avg", "mean"]) and any(w in q for w in ["where", "who", "with", "left", "yes", "true", "churn"]):
+            val_col = next((col_map[c] for c in col_names if c in q), None)
+            if not val_col:
+                val_col = find_col(["income", "salary", "amount", "price", "sales", "revenue", "value", "cost"], prefer_numeric=True)
+            cond_col = next((col_map[c] for c in col_names if len(c) > 2 and (c in q or (c in ["attrition", "churn"] and any(k in q for k in ["left", "resigned", "quit", "churn"]))) and c != (val_col or '').lower()), None)
+            if cond_col and val_col:
+                sql = f'SELECT ROUND(AVG("{val_col}")::numeric, 2) AS avg_{val_col} FROM "{table_name}" WHERE LOWER(CAST("{cond_col}" AS text)) IN (\'yes\', \'true\', \'1\', \'y\');'
                 return {
                     "status": "query",
                     "sql": sql,
-                    "explanation": f"Calculated the average {val_col} of employees who left (attrition = 'Yes').",
+                    "explanation": f"Calculated the average {val_col} for records matching condition.",
                     "clarification_question": None
                 }
 
-        # 4. Count queries: Filtered count (e.g. "How many employees left the company?")
-        if ("how many" in q or "count" in q or "number of" in q) and ("left" in q or "resigned" in q or "quit" in q or "attrition" in q):
-            if attrition_col:
-                sql = f'SELECT COUNT(*) AS employees_left FROM "{table_name}" WHERE LOWER("{attrition_col}") = \'yes\';'
+        # 4. Filtered count queries (e.g. "How many <items> where ...")
+        if any(w in q for w in ["how many", "count", "number of"]) and any(w in q for w in ["where", "left", "resigned", "quit", "churn", "returned", "cancelled", "active"]):
+            cond_col = next((col_map[c] for c in col_names if len(c) > 2 and (c in q or (c in ["attrition", "churn"] and any(k in q for k in ["left", "resigned", "quit", "churn"])))), None)
+            if cond_col:
+                sql = f'SELECT COUNT(*) AS total_matching FROM "{table_name}" WHERE LOWER(CAST("{cond_col}" AS text)) IN (\'yes\', \'true\', \'1\', \'y\');'
                 return {
                     "status": "query",
                     "sql": sql,
-                    "explanation": "Counted employees who left the company (attrition = 'Yes').",
+                    "explanation": f"Counted records where {cond_col} matches positive condition.",
                     "clarification_question": None
                 }
 
-        # 5. Unfiltered Count queries (e.g. "How many employees are in this dataset?", "how many rows", "total rows")
-        if "how many employees" in q or "total employees" in q or "how many rows" in q or "row count" in q or "count of employees" in q or "total rows" in q:
-            sql = f'SELECT COUNT(*) AS total_employees FROM "{table_name}";'
+        # 5. Total count queries (e.g. "How many rows in dataset?", "total rows", "how many items")
+        if any(w in q for w in ["how many", "total", "count"]) and any(w in q for w in ["rows", "records", "items", "dataset", "people", "employees", "orders", "users", "customers"]):
+            sql = f'SELECT COUNT(*) AS total_records FROM "{table_name}";'
             return {
                 "status": "query",
                 "sql": sql,
-                "explanation": "Counted total employees in dataset.",
+                "explanation": "Counted total records in dataset.",
                 "clarification_question": None
             }
 
@@ -749,11 +756,7 @@ class SQLGenerator:
         if any(w in q for w in ["highest", "top", "best"]) and any(w in q for w in ["sales", "revenue", "order", "total", "income", "amount"]):
             group_col = find_col(["city", "region", "country", "customer", "category", "product", "department"])
             val_col = find_col(["sales", "amount", "total", "price", "revenue", "net_amount", "monthlyincome"], prefer_numeric=True)
-            limit_n = 5
-            if "five" in q or " 5 " in q:
-                limit_n = 5
-            elif "ten" in q or " 10 " in q:
-                limit_n = 10
+            limit_n = 10 if ("ten" in q or " 10 " in q) else 5
             if group_col and val_col:
                 sql = f'SELECT "{group_col}", SUM("{val_col}") AS total_{val_col} FROM "{table_name}" GROUP BY "{group_col}" ORDER BY total_{val_col} DESC LIMIT {limit_n};'
                 return {
@@ -764,17 +767,19 @@ class SQLGenerator:
                 }
 
         # 8. Filter by city or location (e.g. "Show orders from Hyderabad", "Now only show Hyderabad")
-        if "orders from" in q or "from hyderabad" in q or "show orders" in q or "in hyderabad" in q or "hyderabad" in q:
-            city_col = find_col(["city", "location", "place"])
-            city_val = "hyderabad" if "hyderabad" in q else "all"
-            if city_col:
-                sql = f'SELECT * FROM "{table_name}" WHERE LOWER("{city_col}") = \'{city_val}\' LIMIT 50;'
-                return {
-                    "status": "query",
-                    "sql": sql,
-                    "explanation": f"Retrieved orders filtered by {city_col} = '{city_val}'.",
-                    "clarification_question": None
-                }
+        loc_match = re.search(r'\b(?:from|in|show|filter to|only show)\s+([a-zA-Z_\s]+?)(?:\s+orders|\s+customers|\s+records|\s*$)', q)
+        if loc_match:
+            loc_val = loc_match.group(1).strip()
+            if loc_val and loc_val.lower() not in ["all", "table", "data", "dataset", "column", "columns"]:
+                city_col = find_col(["city", "location", "place", "region", "state", "department"])
+                if city_col:
+                    sql = f'SELECT * FROM "{table_name}" WHERE LOWER("{city_col}") = \'{loc_val.lower()}\' LIMIT 50;'
+                    return {
+                        "status": "query",
+                        "sql": sql,
+                        "explanation": f"Retrieved records filtered by {city_col} = '{loc_val}'.",
+                        "clarification_question": None
+                    }
 
         # 9. Duplicates (e.g. "How many duplicate customer IDs are there?")
         if "duplicate" in q:

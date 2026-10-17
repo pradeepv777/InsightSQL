@@ -3,19 +3,25 @@ import uuid
 import re
 import json
 from io import BytesIO
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 import pandas as pd
-import pyarrow.parquet as pq
-from sqlalchemy import text, inspect
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import engine
 from app.models.models import Dataset, DatasetTable, ColumnMetadata, RetrievalDocument
 
+# File extensions permitted for automated tabular ingestion
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".parquet", ".json"}
 
 def sanitize_identifier(name: str) -> str:
-    """Sanitizes an identifier to a safe PostgreSQL lowercase column name."""
+    """
+    Sanitizes arbitrary user column headers into safe PostgreSQL column identifiers.
+    - Strips non-alphanumeric characters, converts to lowercase.
+    - Prepends 'col_' if header starts with a digit or becomes empty.
+    - Truncates to 63 chars (PostgreSQL's default NAMEDATALEN limit).
+    - Prevents DDL injection via malicious column names in uploaded files.
+    """
     clean = re.sub(r'[^a-zA-Z0-9_]', '_', name.strip().lower())
     clean = re.sub(r'_+', '_', clean).strip('_')
     if not clean or clean[0].isdigit():
@@ -23,12 +29,21 @@ def sanitize_identifier(name: str) -> str:
     return clean[:63]
 
 def generate_safe_table_name() -> str:
-    """Generates a safe internal table name that does not collide and cannot be injected."""
+    """
+    Generates a collision-resistant internal table name (e.g. ds_tbl_4f9a1c8b2e3d).
+    Decouples user-supplied display names from physical database tables to prevent SQL injection.
+    """
     uid = uuid.uuid4().hex[:12]
     return f"ds_tbl_{uid}"
 
 def map_dtype_to_postgres(series: pd.Series) -> str:
-    """Conservatively maps pandas dtypes to standard PostgreSQL data types."""
+    """
+    Conservatively maps pandas Series data types to native PostgreSQL storage types:
+    - 64-bit ints -> BIGINT, smaller ints -> INTEGER
+    - Floating point -> DOUBLE PRECISION
+    - Datetime or string-encoded timestamps -> TIMESTAMP
+    - Fallback -> TEXT (safe for mixed-type columns)
+    """
     dtype_str = str(series.dtype).lower()
     
     if "int64" in dtype_str:
@@ -49,8 +64,22 @@ def map_dtype_to_postgres(series: pd.Series) -> str:
         return "TEXT"
 
 class IngestionService:
+    """
+    Automated Data Ingestion & Schema Profiling Service.
+    Transforms arbitrary uploaded files (CSV, Excel, Parquet, JSON) into queryable PostgreSQL tables
+    and automatically indexes their column statistics for RAG schema grounding.
+    """
+
     @classmethod
     def parse_file(cls, filename: str, content: bytes) -> pd.DataFrame:
+        """
+        Safely parses uploaded file bytes into a normalized pandas DataFrame:
+        - Validates extension against allowlist.
+        - Enforces maximum file upload size (MAX_UPLOAD_MB).
+        - Handles encoding errors (e.g. latin1 fallback for CSVs).
+        - Caps rows at MAX_IMPORT_ROWS to prevent out-of-memory denial of service.
+        - De-duplicates and sanitizes column headers into valid SQL identifiers.
+        """
         ext = os.path.splitext(filename)[1].lower()
         if ext not in SUPPORTED_EXTENSIONS:
             raise ValueError(f"Unsupported file format '{ext}'. Supported: {', '.join(SUPPORTED_EXTENSIONS)}")
@@ -62,7 +91,7 @@ class IngestionService:
         
         try:
             if ext == ".csv":
-                # Try common encodings
+                # Resilient CSV parsing: fallback from utf-8 to latin1 if standard decoding fails
                 try:
                     df = pd.read_csv(bio, nrows=settings.MAX_IMPORT_ROWS)
                 except UnicodeDecodeError:
@@ -95,7 +124,7 @@ class IngestionService:
         if df.empty:
             raise ValueError("The uploaded dataset contains no rows")
 
-        # Normalize column names and handle duplicates
+        # Column normalization: sanitize headers and disambiguate duplicates (e.g., 'price', 'price_1')
         raw_cols = [str(c) if c is not None else "col" for c in df.columns]
         normalized_cols = []
         counts: Dict[str, int] = {}
@@ -120,6 +149,17 @@ class IngestionService:
         owner_id: str = "default_user",
         display_name: str = None
     ) -> Dataset:
+        """
+        End-to-End Dataset Ingestion Lifecycle:
+          1. Parses & sanitizes DataFrame.
+          2. Creates tracking Dataset record (status='processing').
+          3. Infers native PostgreSQL types for each column.
+          4. Executes DDL (`CREATE TABLE "ds_tbl_{uid}" (...)`) in PostgreSQL.
+          5. Loads rows in batches of 5,000 using clean type coercion.
+          6. Persists DatasetTable & ColumnMetadata records.
+          7. Computes column null rates, unique cardinality, and sample values.
+          8. Indexes table schema & column descriptions as RAG RetrievalDocuments.
+        """
         ext = os.path.splitext(filename)[1].lower()
         disp_name = display_name or os.path.splitext(filename)[0]
         
@@ -143,20 +183,20 @@ class IngestionService:
         table_name = generate_safe_table_name()
         
         try:
-            # 3. Infer types
+            # 3. Infer native PostgreSQL data types for each column
             col_types = {}
             for col in df.columns:
                 col_types[col] = map_dtype_to_postgres(df[col])
                 
-            # 4. Create internal PostgreSQL table
+            # 4. Create internal PostgreSQL table with quoted identifiers
             col_defs = [f'"{col}" {col_types[col]}' for col in df.columns]
             create_sql = f'CREATE TABLE "{table_name}" ({", ".join(col_defs)});'
             
             with engine.begin() as conn:
                 conn.execute(text(create_sql))
                 
-            # 5. Load records to PostgreSQL table
-            # Convert timestamps/objects safely before inserting
+            # 5. Load records to PostgreSQL table in 5,000-row chunks
+            # Explicitly coerce values into their target types to prevent insertion failures
             clean_df = df.copy()
             for col, pg_type in col_types.items():
                 if pg_type == "TIMESTAMP":
@@ -174,7 +214,7 @@ class IngestionService:
                 chunksize=5000
             )
 
-            # 6. Save DatasetTable metadata
+            # 6. Save DatasetTable metadata linking internal table name to dataset
             ds_table = DatasetTable(
                 dataset_id=dataset.id,
                 schema_name="public",
@@ -186,7 +226,7 @@ class IngestionService:
             db.commit()
             db.refresh(ds_table)
 
-            # 7. Compute column metrics & profile
+            # 7. Compute column metrics & profile (cached for fast-path null/cardinality lookups)
             for col in df.columns:
                 null_count = int(df[col].isnull().sum())
                 unique_count = int(df[col].nunique())
@@ -208,7 +248,8 @@ class IngestionService:
                 )
                 db.add(col_meta)
 
-            # 8. Create Retrieval Documentation documents for RAG
+            # 8. Create Retrieval Documentation documents for RAG grounding
+            # Allows BM25 search in RAGService to surface schema context when generating SQL
             schema_summary = f"Table '{table_name}' (named '{disp_name}') has {row_count} rows and columns: " + \
                 ", ".join([f"{c} ({col_types[c]})" for c in df.columns])
                 
